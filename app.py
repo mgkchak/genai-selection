@@ -73,9 +73,8 @@ CSV_COLUMNS = [
 BATCH_CSV_COLUMNS = ["paper_id", "title", "authors", "year", "url", "file_path"]
 
 SYSTEM_PROMPT = """You are a systematic literature review screener for the GenAI Evidence Hub,
-a research initiative at the University of Pennsylvania examining generative AI in educational
-assessment contexts. Your job is to evaluate whether a research paper meets the inclusion criteria
-for this meta-analysis.
+a research initiative examining generative AI in educational assessment contexts. Your job is 
+to evaluate whether a research paper meets the inclusion criteria for this meta-analysis.
 
 You must evaluate each paper against ALL THREE criteria and provide a structured JSON response.
 
@@ -368,7 +367,7 @@ class PaperScreenerApp(tk.Tk):
         tk.Label(hdr, text="GenAI Evidence Hub",
                  font=("Georgia", 18, "bold"),
                  fg=PALETTE["amber"], bg=PALETTE["navy"]).pack(side="left", padx=20, pady=12)
-        tk.Label(hdr, text="Paper Screening Tool  |  University of Pennsylvania · LDI",
+        tk.Label(hdr, text="Paper Screening Tool  |  Learning Data Insights, LLC",
                  font=("Georgia", 10),
                  fg=PALETTE["grey_light"], bg=PALETTE["navy"]).pack(side="left", pady=18)
 
