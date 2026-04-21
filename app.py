@@ -2,6 +2,10 @@
 GenAI Evidence Hub — Paper Screening Tool
 Screens papers for inclusion/exclusion in the systematic literature review
 based on the GenAI Evidence Hub criteria.
+
+Backends:
+  • Ollama  — free, fully local, no API key required (default)
+  • Anthropic API — higher accuracy, requires paid credits
 """
 
 import tkinter as tk
@@ -14,17 +18,31 @@ import datetime
 import base64
 import requests
 import pdfplumber
-import anthropic
 from pathlib import Path
 import io
 import re
 
-# ── Constants ────────────────────────────────────────────────────────────────
+# Anthropic SDK is optional — only needed for API mode
+try:
+    import anthropic as _anthropic_sdk
+    ANTHROPIC_AVAILABLE = True
+except ImportError:
+    ANTHROPIC_AVAILABLE = False
+
+# ── Backend constants ─────────────────────────────────────────────────────────
+
+MODE_OLLAMA     = "ollama"
+MODE_API        = "api"
+OLLAMA_BASE_URL = "http://localhost:11434"
+OLLAMA_MODELS   = ["llama3.2", "llama3.1", "mistral", "mixtral", "gemma2", "phi3"]
+DEFAULT_MODEL   = "llama3.2"
+
+# ── App constants ─────────────────────────────────────────────────────────────
 
 APP_TITLE = "GenAI Evidence Hub — Paper Screener"
-REPO_DIR = Path.home() / "genai_evidence_hub"
+REPO_DIR  = Path.home() / "genai_evidence_hub"
 REPO_JSON = REPO_DIR / "paper_repository.json"
-REPO_CSV = REPO_DIR / "paper_repository.csv"
+REPO_CSV  = REPO_DIR / "paper_repository.csv"
 BATCH_TEMPLATE_CSV = REPO_DIR / "batch_template.csv"
 
 PALETTE = {
@@ -44,9 +62,19 @@ PALETTE = {
     "bg":         "#F0F4FA",
 }
 
-SYSTEM_PROMPT = """You are a systematic literature review screener for the GenAI Evidence Hub, 
-a research initiative at the University of Pennsylvania examining generative AI in educational 
-assessment contexts. Your job is to evaluate whether a research paper meets the inclusion criteria 
+CSV_COLUMNS = [
+    "paper_id", "title", "authors", "year", "url", "file_path",
+    "recommendation", "confidence", "genai_used", "relevant_domain",
+    "quality_assurance", "domains_identified", "metrics_identified",
+    "key_decision_factors", "additional_notes", "analyzed_at",
+    "backend_used", "model_used",
+]
+
+BATCH_CSV_COLUMNS = ["paper_id", "title", "authors", "year", "url", "file_path"]
+
+SYSTEM_PROMPT = """You are a systematic literature review screener for the GenAI Evidence Hub,
+a research initiative at the University of Pennsylvania examining generative AI in educational
+assessment contexts. Your job is to evaluate whether a research paper meets the inclusion criteria
 for this meta-analysis.
 
 You must evaluate each paper against ALL THREE criteria and provide a structured JSON response.
@@ -62,10 +90,10 @@ Paper describes research using Generative AI.
 
 ### Criterion 2: Relevant Assessment Domain
 Research must focus on one or more of these educational assessment domains:
-- **Item Generation**: Creation of assessment items (forced choice, problem-based, simulations, etc.)
-- **Formative Feedback**: Real-time feedback to students to improve knowledge/skills/abilities
-- **Automated Item Scoring**: AI scoring of complex student work (essays, short answer, simulations) typically scored by humans
-- **Multimodal (Audio/Video) Inferences**: Assessment using audio/video data in classroom contexts
+- Item Generation: Creation of assessment items (forced choice, problem-based, simulations, etc.)
+- Formative Feedback: Real-time feedback to students to improve knowledge/skills/abilities
+- Automated Item Scoring: AI scoring of complex student work (essays, short answer, simulations) typically scored by humans
+- Multimodal (Audio/Video) Inferences: Assessment using audio/video data in classroom contexts
 - Educational/tutoring context required. Socioemotional skill teaching is OK.
 - EXCLUDE: papers that only address fairness approaches without any evaluation
 
@@ -85,45 +113,36 @@ Acceptable metrics include (but not limited to):
 - MANUAL_REVIEW: Borderline cases, unclear evidence, partial satisfaction, conflicting information
 
 ## Required Output Format
-Respond ONLY with valid JSON in this exact structure:
+Respond ONLY with valid JSON in this exact structure (no markdown fences, no preamble):
 {
-  "overall_recommendation": "INCLUDE" | "EXCLUDE" | "MANUAL_REVIEW",
+  "overall_recommendation": "INCLUDE",
   "criteria": {
     "genai_used": {
-      "verdict": "YES" | "NO" | "UNCLEAR",
+      "verdict": "YES",
       "reasoning": "Detailed explanation",
       "text_examples": "Direct quotes or paraphrases from the paper",
       "location": "Page/section references where possible"
     },
     "relevant_domain": {
-      "verdict": "YES" | "NO" | "UNCLEAR",
-      "domains_identified": ["list of matching domains"],
+      "verdict": "YES",
+      "domains_identified": ["Automated Item Scoring"],
       "reasoning": "Detailed explanation",
       "text_examples": "Direct quotes or paraphrases from the paper",
       "location": "Page/section references where possible"
     },
     "quality_assurance": {
-      "verdict": "YES" | "NO" | "UNCLEAR",
-      "metrics_identified": ["list of metrics found"],
+      "verdict": "YES",
+      "metrics_identified": ["F1", "Kappa"],
       "reasoning": "Detailed explanation",
       "text_examples": "Direct quotes or paraphrases from the paper",
       "location": "Page/section references where possible"
     }
   },
-  "confidence_level": "High" | "Medium" | "Low",
+  "confidence_level": "High",
   "confidence_rationale": "Explanation of confidence level",
   "key_decision_factors": "Most important elements that led to the decision",
   "additional_notes": "Any relevant observations, edge cases, or recommendations for human reviewers"
 }"""
-
-CSV_COLUMNS = [
-    "paper_id", "title", "authors", "year", "url", "file_path",
-    "recommendation", "confidence", "genai_used", "relevant_domain",
-    "quality_assurance", "domains_identified", "metrics_identified",
-    "key_decision_factors", "additional_notes", "analyzed_at", "full_json_path"
-]
-
-BATCH_CSV_COLUMNS = ["paper_id", "title", "authors", "year", "url", "file_path"]
 
 
 # ── Repository ────────────────────────────────────────────────────────────────
@@ -134,27 +153,22 @@ def ensure_repo():
         REPO_JSON.write_text(json.dumps([], indent=2))
     if not REPO_CSV.exists():
         with open(REPO_CSV, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
-            writer.writeheader()
-    # Write batch template
+            csv.DictWriter(f, fieldnames=CSV_COLUMNS).writeheader()
     if not BATCH_TEMPLATE_CSV.exists():
         with open(BATCH_TEMPLATE_CSV, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=BATCH_CSV_COLUMNS)
-            writer.writeheader()
-            writer.writerow({
-                "paper_id": "PAPER_001",
-                "title": "Example Paper Title",
-                "authors": "Smith, J.; Jones, A.",
-                "year": "2024",
-                "url": "https://example.com/paper.pdf",
-                "file_path": ""
+            w = csv.DictWriter(f, fieldnames=BATCH_CSV_COLUMNS)
+            w.writeheader()
+            w.writerow({
+                "paper_id": "PAPER_001", "title": "Example Paper Title",
+                "authors": "Smith, J.; Jones, A.", "year": "2024",
+                "url": "https://example.com/paper.pdf", "file_path": "",
             })
 
 
 def load_repository():
     ensure_repo()
     try:
-        return json.loads(REPO_JSON.read_text())
+        return json.loads(REPO_JSON.read_text(encoding="utf-8"))
     except Exception:
         return []
 
@@ -162,108 +176,145 @@ def load_repository():
 def save_to_repository(entry: dict):
     ensure_repo()
     repo = load_repository()
-
-    # Update if paper_id already exists
     for i, r in enumerate(repo):
         if r.get("paper_id") == entry.get("paper_id"):
             repo[i] = entry
             break
     else:
         repo.append(entry)
-
-    REPO_JSON.write_text(json.dumps(repo, indent=2))
+    REPO_JSON.write_text(json.dumps(repo, indent=2, ensure_ascii=False), encoding="utf-8")
     _sync_csv(repo)
 
 
 def _sync_csv(repo: list):
-    """Rebuild the CSV from the JSON repository."""
     with open(REPO_CSV, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS, extrasaction="ignore")
-        writer.writeheader()
+        w = csv.DictWriter(f, fieldnames=CSV_COLUMNS, extrasaction="ignore")
+        w.writeheader()
         for r in repo:
-            writer.writerow(r)
+            w.writerow(r)
 
 
-# ── PDF / URL fetching ────────────────────────────────────────────────────────
+# ── PDF helpers ───────────────────────────────────────────────────────────────
 
 def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
-    """Extract text from PDF bytes using pdfplumber."""
-    text_parts = []
+    parts = []
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for i, page in enumerate(pdf.pages):
             t = page.extract_text()
             if t:
-                text_parts.append(f"[Page {i+1}]\n{t}")
-    return "\n\n".join(text_parts)
+                parts.append(f"[Page {i+1}]\n{t}")
+    return "\n\n".join(parts)
 
 
-def fetch_pdf_from_url(url: str) -> tuple[bytes | None, str]:
-    """Try to fetch a PDF from a URL. Returns (bytes, error_msg)."""
+def fetch_pdf_from_url(url: str):
+    """Returns (bytes_or_None, error_str)."""
     try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (compatible; GenAI Evidence Hub Screener)"
-        }
+        headers = {"User-Agent": "Mozilla/5.0 (compatible; GenAI Evidence Hub Screener)"}
         resp = requests.get(url, headers=headers, timeout=30, allow_redirects=True)
         resp.raise_for_status()
-        content_type = resp.headers.get("content-type", "")
-        if "pdf" in content_type or url.lower().endswith(".pdf"):
+        ct = resp.headers.get("content-type", "")
+        if "pdf" in ct or url.lower().endswith(".pdf") or resp.content[:4] == b"%PDF":
             return resp.content, ""
-        # Try anyway if the content looks like a PDF
-        if resp.content[:4] == b"%PDF":
-            return resp.content, ""
-        return None, f"URL did not return a PDF (content-type: {content_type})"
+        return None, f"URL did not return a PDF (content-type: {ct})"
     except requests.exceptions.RequestException as e:
         return None, str(e)
 
 
-# ── Claude API analysis ───────────────────────────────────────────────────────
+# ── Analysis backends ─────────────────────────────────────────────────────────
 
-def analyze_paper_with_claude(pdf_bytes: bytes, api_key: str,
-                               progress_callback=None) -> dict:
-    """Send PDF to Claude for analysis. Returns parsed result dict."""
-    client = anthropic.Anthropic(api_key=api_key)
+def _clean_json(raw: str) -> dict:
+    """Strip markdown fences and extract the JSON object."""
+    raw = raw.strip()
+    raw = re.sub(r"^```json\s*", "", raw)
+    raw = re.sub(r"^```\s*",     "", raw)
+    raw = re.sub(r"\s*```$",     "", raw)
+    start, end = raw.find("{"), raw.rfind("}")
+    if start != -1 and end != -1:
+        raw = raw[start:end+1]
+    return json.loads(raw)
 
-    if progress_callback:
-        progress_callback("Sending paper to Claude for analysis…")
 
-    # Encode PDF as base64
-    pdf_b64 = base64.standard_b64encode(pdf_bytes).decode("utf-8")
-
-    response = client.messages.create(
-        model="claude-opus-4-5",
-        max_tokens=4096,
-        system=SYSTEM_PROMPT,
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "document",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "application/pdf",
-                            "data": pdf_b64,
-                        },
-                    },
-                    {
-                        "type": "text",
-                        "text": (
-                            "Please evaluate this paper against the GenAI Evidence Hub "
-                            "inclusion criteria. Review the full paper carefully before "
-                            "responding. Return ONLY valid JSON — no markdown, no preamble."
-                        ),
-                    },
-                ],
-            }
-        ],
+def _user_prompt_from_text(text: str) -> str:
+    return (
+        "Evaluate the following research paper against the GenAI Evidence Hub "
+        "inclusion criteria. Read carefully before deciding.\n\n"
+        "Return ONLY valid JSON — no markdown fences, no preamble.\n\n"
+        f"--- PAPER TEXT ---\n{text[:120000]}"
     )
 
-    raw = response.content[0].text.strip()
-    # Strip markdown fences if present
-    raw = re.sub(r"^```json\s*", "", raw)
-    raw = re.sub(r"\s*```$", "", raw)
 
-    return json.loads(raw)
+def check_ollama_status():
+    """Returns (is_running: bool, installed_models: list[str])."""
+    try:
+        resp = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=3)
+        models = [m["name"].split(":")[0] for m in resp.json().get("models", [])]
+        return True, sorted(set(models))
+    except Exception:
+        return False, []
+
+
+def analyze_with_ollama(pdf_bytes: bytes, model: str, progress_callback=None) -> dict:
+    if progress_callback:
+        progress_callback("Extracting text from PDF…")
+    text = extract_text_from_pdf_bytes(pdf_bytes)
+    if not text.strip():
+        raise ValueError(
+            "No extractable text found in the PDF.\n"
+            "The file may be a scanned image. Please try a text-based PDF."
+        )
+    if progress_callback:
+        progress_callback(f"Sending to local model ({model})… may take 1–3 min on CPU.")
+
+    payload = {
+        "model": model, "stream": False,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user",   "content": _user_prompt_from_text(text)},
+        ],
+        "options": {"temperature": 0.1, "num_predict": 4096},
+    }
+    try:
+        resp = requests.post(f"{OLLAMA_BASE_URL}/api/chat", json=payload, timeout=600)
+        resp.raise_for_status()
+    except requests.exceptions.ConnectionError:
+        raise ConnectionError(
+            "Cannot connect to Ollama.\n\n"
+            "To fix this:\n"
+            "  1. Download Ollama from https://ollama.com\n"
+            "  2. Install and open it — it runs in the system tray\n"
+            "  3. Open Command Prompt and run:  ollama pull llama3.2\n"
+            "     (one-time ~2 GB download)\n"
+            "  4. Then click Analyze again"
+        )
+    raw = resp.json().get("message", {}).get("content", "")
+    return _clean_json(raw)
+
+
+def analyze_with_api(pdf_bytes: bytes, api_key: str, progress_callback=None) -> dict:
+    if not ANTHROPIC_AVAILABLE:
+        raise ImportError("Run:  pip install anthropic")
+    if progress_callback:
+        progress_callback("Sending PDF to Claude API…")
+    client  = _anthropic_sdk.Anthropic(api_key=api_key)
+    pdf_b64 = base64.standard_b64encode(pdf_bytes).decode("utf-8")
+    response = client.messages.create(
+        model="claude-opus-4-5", max_tokens=4096, system=SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": [
+            {"type": "document", "source": {
+                "type": "base64", "media_type": "application/pdf", "data": pdf_b64}},
+            {"type": "text", "text":
+                "Evaluate this paper against the GenAI Evidence Hub inclusion criteria. "
+                "Return ONLY valid JSON — no markdown, no preamble."},
+        ]}],
+    )
+    return _clean_json(response.content[0].text)
+
+
+def analyze_paper(pdf_bytes: bytes, mode: str, api_key: str = "",
+                  ollama_model: str = DEFAULT_MODEL, progress_callback=None) -> dict:
+    if mode == MODE_API:
+        return analyze_with_api(pdf_bytes, api_key, progress_callback)
+    return analyze_with_ollama(pdf_bytes, ollama_model, progress_callback)
 
 
 # ── GUI ───────────────────────────────────────────────────────────────────────
@@ -272,13 +323,16 @@ class PaperScreenerApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_TITLE)
-        self.geometry("1100x780")
-        self.minsize(900, 650)
+        self.geometry("1100x800")
+        self.minsize(900, 660)
         self.configure(bg=PALETTE["bg"])
 
         ensure_repo()
-        self._api_key = tk.StringVar()
-        self._current_pdf_bytes: bytes | None = None
+        self._api_key       = tk.StringVar()
+        self._mode          = tk.StringVar(value=MODE_OLLAMA)
+        self._ollama_model  = tk.StringVar(value=DEFAULT_MODEL)
+        self._current_pdf_bytes = None
+        self._batch_csv_path    = None
         self._busy = False
 
         self._build_ui()
@@ -288,10 +342,8 @@ class PaperScreenerApp(tk.Tk):
 
     def _build_ui(self):
         self._build_header()
-
         self.notebook = ttk.Notebook(self)
         self.notebook.pack(fill="both", expand=True, padx=16, pady=(0, 16))
-
         self._style_notebook()
 
         self.tab_single = tk.Frame(self.notebook, bg=PALETTE["bg"])
@@ -313,280 +365,225 @@ class PaperScreenerApp(tk.Tk):
         hdr = tk.Frame(self, bg=PALETTE["navy"], height=64)
         hdr.pack(fill="x")
         hdr.pack_propagate(False)
-
-        tk.Label(
-            hdr,
-            text="GenAI Evidence Hub",
-            font=("Georgia", 18, "bold"),
-            fg=PALETTE["amber"],
-            bg=PALETTE["navy"],
-        ).pack(side="left", padx=20, pady=12)
-
-        tk.Label(
-            hdr,
-            text="Paper Screening Tool  |  University of Pennsylvania · LDI",
-            font=("Georgia", 10),
-            fg=PALETTE["grey_light"],
-            bg=PALETTE["navy"],
-        ).pack(side="left", padx=0, pady=18)
+        tk.Label(hdr, text="GenAI Evidence Hub",
+                 font=("Georgia", 18, "bold"),
+                 fg=PALETTE["amber"], bg=PALETTE["navy"]).pack(side="left", padx=20, pady=12)
+        tk.Label(hdr, text="Paper Screening Tool  |  University of Pennsylvania · LDI",
+                 font=("Georgia", 10),
+                 fg=PALETTE["grey_light"], bg=PALETTE["navy"]).pack(side="left", pady=18)
 
     def _style_notebook(self):
-        style = ttk.Style(self)
-        style.theme_use("default")
-        style.configure(
-            "TNotebook", background=PALETTE["bg"], borderwidth=0
-        )
-        style.configure(
-            "TNotebook.Tab",
-            background=PALETTE["grey_light"],
-            foreground=PALETTE["navy"],
-            padding=[12, 6],
-            font=("Helvetica", 10, "bold"),
-        )
-        style.map(
-            "TNotebook.Tab",
-            background=[("selected", PALETTE["navy"])],
-            foreground=[("selected", PALETTE["amber"])],
-        )
+        s = ttk.Style(self)
+        s.theme_use("default")
+        s.configure("TNotebook", background=PALETTE["bg"], borderwidth=0)
+        s.configure("TNotebook.Tab", background=PALETTE["grey_light"],
+                    foreground=PALETTE["navy"], padding=[12, 6],
+                    font=("Helvetica", 10, "bold"))
+        s.map("TNotebook.Tab",
+              background=[("selected", PALETTE["navy"])],
+              foreground=[("selected", PALETTE["amber"])])
 
     # ── Single Paper Tab ──────────────────────────────────────────────────────
 
     def _build_single_tab(self):
+        f   = self.tab_single
         pad = {"padx": 16, "pady": 8}
-        f = self.tab_single
 
-        # ── Paper metadata ──
         meta = tk.LabelFrame(f, text=" Paper Information ", bg=PALETTE["bg"],
                              fg=PALETTE["navy"], font=("Helvetica", 10, "bold"),
                              bd=1, relief="groove")
         meta.pack(fill="x", **pad)
-
         grid = tk.Frame(meta, bg=PALETTE["bg"])
         grid.pack(fill="x", padx=12, pady=8)
-
-        labels = ["Paper ID *", "Title", "Authors", "Year"]
         self._meta_vars = {}
-        for i, lbl in enumerate(labels):
+        for i, lbl in enumerate(["Paper ID *", "Title", "Authors", "Year"]):
             tk.Label(grid, text=lbl, bg=PALETTE["bg"], fg=PALETTE["grey_dark"],
                      font=("Helvetica", 9)).grid(row=i, column=0, sticky="w", pady=3)
             var = tk.StringVar()
             self._meta_vars[lbl] = var
-            e = tk.Entry(grid, textvariable=var, width=60,
-                         font=("Helvetica", 10), bd=1, relief="solid")
-            e.grid(row=i, column=1, sticky="ew", padx=(8, 0), pady=3)
+            tk.Entry(grid, textvariable=var, width=60, font=("Helvetica", 10),
+                     bd=1, relief="solid").grid(row=i, column=1, sticky="ew",
+                                                padx=(8,0), pady=3)
         grid.columnconfigure(1, weight=1)
 
-        # ── Source ──
         src = tk.LabelFrame(f, text=" Paper Source ", bg=PALETTE["bg"],
                             fg=PALETTE["navy"], font=("Helvetica", 10, "bold"),
                             bd=1, relief="groove")
         src.pack(fill="x", **pad)
+        inner = tk.Frame(src, bg=PALETTE["bg"])
+        inner.pack(fill="x", padx=12, pady=8)
 
-        src_inner = tk.Frame(src, bg=PALETTE["bg"])
-        src_inner.pack(fill="x", padx=12, pady=8)
-
-        # URL row
-        url_row = tk.Frame(src_inner, bg=PALETTE["bg"])
+        url_row = tk.Frame(inner, bg=PALETTE["bg"])
         url_row.pack(fill="x", pady=3)
         tk.Label(url_row, text="URL:", bg=PALETTE["bg"], fg=PALETTE["grey_dark"],
                  width=10, anchor="w", font=("Helvetica", 9)).pack(side="left")
         self._url_var = tk.StringVar()
         tk.Entry(url_row, textvariable=self._url_var, font=("Helvetica", 10),
-                 bd=1, relief="solid").pack(side="left", fill="x", expand=True, padx=(4, 8))
+                 bd=1, relief="solid").pack(side="left", fill="x", expand=True, padx=(4,8))
         tk.Button(url_row, text="Fetch PDF", command=self._fetch_url,
-                  bg=PALETTE["teal"], fg="white", font=("Helvetica", 9, "bold"),
-                  relief="flat", padx=10).pack(side="left")
+                  bg=PALETTE["teal"], fg="white",
+                  font=("Helvetica", 9, "bold"), relief="flat", padx=10).pack(side="left")
 
-        # Or upload
-        upload_row = tk.Frame(src_inner, bg=PALETTE["bg"])
-        upload_row.pack(fill="x", pady=3)
-        tk.Label(upload_row, text="— or —", bg=PALETTE["bg"], fg=PALETTE["grey_mid"],
+        up_row = tk.Frame(inner, bg=PALETTE["bg"])
+        up_row.pack(fill="x", pady=3)
+        tk.Label(up_row, text="— or —", bg=PALETTE["bg"], fg=PALETTE["grey_mid"],
                  font=("Helvetica", 9, "italic")).pack(side="left", padx=8)
-        tk.Button(upload_row, text="📂  Upload PDF", command=self._upload_pdf,
-                  bg=PALETTE["navy_mid"], fg="white", font=("Helvetica", 9, "bold"),
-                  relief="flat", padx=12).pack(side="left")
-        self._file_label = tk.Label(upload_row, text="No file selected",
+        tk.Button(up_row, text="Upload PDF", command=self._upload_pdf,
+                  bg=PALETTE["navy_mid"], fg="white",
+                  font=("Helvetica", 9, "bold"), relief="flat", padx=12).pack(side="left")
+        self._file_label = tk.Label(up_row, text="No file selected",
                                     bg=PALETTE["bg"], fg=PALETTE["grey_mid"],
                                     font=("Helvetica", 9, "italic"))
         self._file_label.pack(side="left", padx=8)
 
-        # Analyze button
         btn_row = tk.Frame(f, bg=PALETTE["bg"])
         btn_row.pack(fill="x", padx=16, pady=4)
         self._analyze_btn = tk.Button(
-            btn_row, text="▶  Analyze Paper",
+            btn_row, text="Analyze Paper",
             command=self._run_single_analysis,
             bg=PALETTE["amber"], fg=PALETTE["navy"],
-            font=("Helvetica", 11, "bold"), relief="flat", padx=20, pady=8,
-            cursor="hand2"
-        )
+            font=("Helvetica", 11, "bold"), relief="flat",
+            padx=20, pady=8, cursor="hand2")
         self._analyze_btn.pack(side="left")
         self._progress_label = tk.Label(btn_row, text="", bg=PALETTE["bg"],
                                         fg=PALETTE["teal"], font=("Helvetica", 9, "italic"))
         self._progress_label.pack(side="left", padx=12)
 
-        # Results
         res = tk.LabelFrame(f, text=" Analysis Results ", bg=PALETTE["bg"],
                             fg=PALETTE["navy"], font=("Helvetica", 10, "bold"),
                             bd=1, relief="groove")
         res.pack(fill="both", expand=True, **pad)
-
         self._result_text = scrolledtext.ScrolledText(
             res, font=("Courier", 9), bg="#1e2636", fg="#c8d8f0",
-            insertbackground="white", bd=0, padx=10, pady=8,
-            wrap="word"
-        )
+            insertbackground="white", bd=0, padx=10, pady=8, wrap="word")
         self._result_text.pack(fill="both", expand=True, padx=8, pady=8)
-        self._result_text.insert("1.0", "Results will appear here after analysis…")
+        self._result_text.insert("1.0", "Results will appear here after analysis.")
         self._result_text.configure(state="disabled")
-
-        # Tag colors for result display
-        self._result_text.tag_config("include",  foreground="#5BE8A0")
-        self._result_text.tag_config("exclude",  foreground="#FF7B7B")
-        self._result_text.tag_config("manual",   foreground="#FFD166")
-        self._result_text.tag_config("heading",  foreground=PALETTE["amber_light"],
+        for tag, color in [("include","#5BE8A0"),("exclude","#FF7B7B"),
+                           ("manual","#FFD166"),("yes","#5BE8A0"),
+                           ("no","#FF7B7B"),("unclear","#FFD166"),("key","#94D8F0")]:
+            self._result_text.tag_config(tag, foreground=color)
+        self._result_text.tag_config("heading", foreground=PALETTE["amber_light"],
                                      font=("Courier", 10, "bold"))
-        self._result_text.tag_config("key",      foreground="#94D8F0")
-        self._result_text.tag_config("yes",      foreground="#5BE8A0")
-        self._result_text.tag_config("no",       foreground="#FF7B7B")
-        self._result_text.tag_config("unclear",  foreground="#FFD166")
 
     # ── Batch Tab ─────────────────────────────────────────────────────────────
 
     def _build_batch_tab(self):
-        f = self.tab_batch
+        f   = self.tab_batch
         pad = {"padx": 16, "pady": 10}
 
         info = tk.LabelFrame(f, text=" Batch Upload Instructions ", bg=PALETTE["bg"],
                              fg=PALETTE["navy"], font=("Helvetica", 10, "bold"),
                              bd=1, relief="groove")
         info.pack(fill="x", **pad)
-
-        instructions = (
-            "Upload a CSV file with one paper per row. Required column: paper_id. "
-            "Optional columns: title, authors, year, url, file_path.\n"
-            "• url — will be fetched automatically (PDF direct links work best)\n"
-            "• file_path — local path to a PDF file\n"
-            "• If both url and file_path are provided, file_path takes priority\n"
-            "• Columns can appear in any order; extra columns are preserved as metadata"
-        )
-        tk.Label(info, text=instructions, bg=PALETTE["bg"], fg=PALETTE["grey_dark"],
-                 font=("Helvetica", 9), justify="left", wraplength=820).pack(
-            padx=12, pady=8, anchor="w")
-
-        tk.Button(info, text="⬇  Download CSV Template",
+        tk.Label(info, bg=PALETTE["bg"], fg=PALETTE["grey_dark"],
+                 font=("Helvetica", 9), justify="left", wraplength=820,
+                 text=(
+                     "Upload a CSV with one paper per row. Required column: paper_id.\n"
+                     "Optional: title, authors, year, url, file_path. Columns can be in any order.\n"
+                     "  file_path — local path to PDF (takes priority over url)\n"
+                     "  url — direct PDF link, fetched automatically"
+                 )).pack(padx=12, pady=8, anchor="w")
+        tk.Button(info, text="Download CSV Template",
                   command=self._download_batch_template,
                   bg=PALETTE["teal"], fg="white",
                   font=("Helvetica", 9, "bold"), relief="flat", padx=10
-                  ).pack(padx=12, pady=(0, 8), anchor="w")
+                  ).pack(padx=12, pady=(0,8), anchor="w")
 
-        # Upload button
         ctrl = tk.Frame(f, bg=PALETTE["bg"])
         ctrl.pack(fill="x", **pad)
-        tk.Button(ctrl, text="📂  Select Batch CSV",
-                  command=self._select_batch_csv,
+        tk.Button(ctrl, text="Select Batch CSV", command=self._select_batch_csv,
                   bg=PALETTE["navy_mid"], fg="white",
-                  font=("Helvetica", 10, "bold"), relief="flat", padx=12, pady=6
-                  ).pack(side="left")
+                  font=("Helvetica", 10, "bold"), relief="flat",
+                  padx=12, pady=6).pack(side="left")
         self._batch_file_label = tk.Label(ctrl, text="No file selected",
                                           bg=PALETTE["bg"], fg=PALETTE["grey_mid"],
                                           font=("Helvetica", 9, "italic"))
         self._batch_file_label.pack(side="left", padx=10)
-
         self._batch_run_btn = tk.Button(
-            ctrl, text="▶  Run Batch Analysis",
+            ctrl, text="Run Batch Analysis",
             command=self._run_batch_analysis,
             bg=PALETTE["amber"], fg=PALETTE["navy"],
-            font=("Helvetica", 10, "bold"), relief="flat", padx=16, pady=6,
-            cursor="hand2", state="disabled"
-        )
+            font=("Helvetica", 10, "bold"), relief="flat",
+            padx=16, pady=6, cursor="hand2", state="disabled")
         self._batch_run_btn.pack(side="right")
 
-        # Progress
-        prog_frame = tk.Frame(f, bg=PALETTE["bg"])
-        prog_frame.pack(fill="x", padx=16)
-        self._batch_progress = ttk.Progressbar(prog_frame, mode="determinate")
+        pf = tk.Frame(f, bg=PALETTE["bg"])
+        pf.pack(fill="x", padx=16)
+        self._batch_progress = ttk.Progressbar(pf, mode="determinate")
         self._batch_progress.pack(fill="x", pady=4)
-        self._batch_status = tk.Label(prog_frame, text="", bg=PALETTE["bg"],
+        self._batch_status = tk.Label(pf, text="", bg=PALETTE["bg"],
                                       fg=PALETTE["teal"], font=("Helvetica", 9, "italic"))
         self._batch_status.pack(anchor="w")
 
-        # Log
-        log_frame = tk.LabelFrame(f, text=" Batch Log ", bg=PALETTE["bg"],
-                                  fg=PALETTE["navy"], font=("Helvetica", 10, "bold"),
-                                  bd=1, relief="groove")
-        log_frame.pack(fill="both", expand=True, **pad)
+        lf = tk.LabelFrame(f, text=" Batch Log ", bg=PALETTE["bg"],
+                           fg=PALETTE["navy"], font=("Helvetica", 10, "bold"),
+                           bd=1, relief="groove")
+        lf.pack(fill="both", expand=True, **pad)
         self._batch_log = scrolledtext.ScrolledText(
-            log_frame, font=("Courier", 9), bg="#1e2636", fg="#c8d8f0",
-            bd=0, padx=10, pady=8, wrap="word"
-        )
+            lf, font=("Courier", 9), bg="#1e2636", fg="#c8d8f0",
+            bd=0, padx=10, pady=8, wrap="word")
         self._batch_log.pack(fill="both", expand=True, padx=8, pady=8)
-        self._batch_log.tag_config("ok",   foreground="#5BE8A0")
-        self._batch_log.tag_config("err",  foreground="#FF7B7B")
-        self._batch_log.tag_config("info", foreground="#FFD166")
-
-        self._batch_csv_path: str | None = None
+        for tag, color in [("ok","#5BE8A0"),("err","#FF7B7B"),("info","#FFD166")]:
+            self._batch_log.tag_config(tag, foreground=color)
 
     # ── Repository Tab ────────────────────────────────────────────────────────
 
     def _build_repo_tab(self):
-        f = self.tab_repo
+        f   = self.tab_repo
         pad = {"padx": 16, "pady": 8}
 
         ctrl = tk.Frame(f, bg=PALETTE["bg"])
         ctrl.pack(fill="x", **pad)
+        tk.Button(ctrl, text="Refresh", command=self._refresh_repository_tab,
+                  bg=PALETTE["teal"], fg="white",
+                  font=("Helvetica", 9, "bold"), relief="flat", padx=10).pack(side="left")
+        tk.Button(ctrl, text="Open Folder",
+                  command=lambda: os.startfile(REPO_DIR),
+                  bg=PALETTE["navy_mid"], fg="white",
+                  font=("Helvetica", 9, "bold"), relief="flat", padx=10
+                  ).pack(side="left", padx=8)
 
-        tk.Button(ctrl, text="🔄  Refresh", command=self._refresh_repository_tab,
-                  bg=PALETTE["teal"], fg="white", font=("Helvetica", 9, "bold"),
-                  relief="flat", padx=10).pack(side="left")
-        tk.Button(ctrl, text="📂  Open Repository Folder",
-                  command=lambda: os.startfile(REPO_DIR) if os.name == "nt"
-                  else os.system(f'open "{REPO_DIR}"'),
-                  bg=PALETTE["navy_mid"], fg="white", font=("Helvetica", 9, "bold"),
-                  relief="flat", padx=10).pack(side="left", padx=8)
-
-        # Filter bar
-        filter_frame = tk.Frame(ctrl, bg=PALETTE["bg"])
-        filter_frame.pack(side="right")
-        tk.Label(filter_frame, text="Filter:", bg=PALETTE["bg"],
-                 fg=PALETTE["grey_dark"], font=("Helvetica", 9)).pack(side="left")
+        ff = tk.Frame(ctrl, bg=PALETTE["bg"])
+        ff.pack(side="right")
+        tk.Label(ff, text="Search:", bg=PALETTE["bg"], fg=PALETTE["grey_dark"],
+                 font=("Helvetica", 9)).pack(side="left")
         self._filter_var = tk.StringVar()
         self._filter_var.trace_add("write", lambda *_: self._refresh_repository_tab())
-        tk.Entry(filter_frame, textvariable=self._filter_var, width=20,
+        tk.Entry(ff, textvariable=self._filter_var, width=20,
                  font=("Helvetica", 9), bd=1, relief="solid").pack(side="left", padx=4)
 
         self._rec_filter = tk.StringVar(value="All")
-        for val in ["All", "INCLUDE", "EXCLUDE", "MANUAL_REVIEW"]:
-            color = {"All": PALETTE["grey_mid"], "INCLUDE": PALETTE["green"],
-                     "EXCLUDE": PALETTE["red"], "MANUAL_REVIEW": PALETTE["orange"]}.get(val, PALETTE["grey_mid"])
-            rb = tk.Radiobutton(filter_frame, text=val, variable=self._rec_filter,
-                                value=val, command=self._refresh_repository_tab,
-                                bg=PALETTE["bg"], fg=color, activebackground=PALETTE["bg"],
-                                font=("Helvetica", 9, "bold"), selectcolor=PALETTE["bg"])
-            rb.pack(side="left", padx=4)
+        for val, color in [("All", PALETTE["grey_mid"]), ("INCLUDE", PALETTE["green"]),
+                           ("EXCLUDE", PALETTE["red"]), ("MANUAL_REVIEW", PALETTE["orange"])]:
+            tk.Radiobutton(ff, text=val, variable=self._rec_filter, value=val,
+                           command=self._refresh_repository_tab,
+                           bg=PALETTE["bg"], fg=color, activebackground=PALETTE["bg"],
+                           font=("Helvetica", 9, "bold"),
+                           selectcolor=PALETTE["amber"],
+                           indicatoron=1).pack(side="left", padx=4)
 
-        # Treeview
-        cols = ("paper_id", "title", "year", "recommendation", "confidence", "analyzed_at")
-        col_widths = (100, 320, 50, 120, 80, 130)
+        cols   = ("paper_id","title","year","recommendation","confidence","backend_used","analyzed_at")
+        widths = (100, 270, 50, 120, 80, 100, 130)
 
-        tree_frame = tk.Frame(f, bg=PALETTE["bg"])
-        tree_frame.pack(fill="both", expand=True, padx=16, pady=(0, 4))
+        tf = tk.Frame(f, bg=PALETTE["bg"])
+        tf.pack(fill="both", expand=True, padx=16, pady=(0,4))
 
-        style = ttk.Style()
-        style.configure("Repo.Treeview", rowheight=26, font=("Helvetica", 9),
-                        background=PALETTE["white"], fieldbackground=PALETTE["white"],
-                        foreground=PALETTE["navy"])
-        style.configure("Repo.Treeview.Heading", font=("Helvetica", 9, "bold"),
-                        background=PALETTE["navy"], foreground="white")
+        s = ttk.Style()
+        s.configure("Repo.Treeview", rowheight=26, font=("Helvetica", 9),
+                    background=PALETTE["white"], fieldbackground=PALETTE["white"],
+                    foreground=PALETTE["navy"])
+        s.configure("Repo.Treeview.Heading", font=("Helvetica", 9, "bold"),
+                    background=PALETTE["navy"], foreground="white")
 
-        self._tree = ttk.Treeview(tree_frame, columns=cols, show="headings",
+        self._tree = ttk.Treeview(tf, columns=cols, show="headings",
                                   style="Repo.Treeview", selectmode="browse")
-        for col, w in zip(cols, col_widths):
-            self._tree.heading(col, text=col.replace("_", " ").title(),
+        for col, w in zip(cols, widths):
+            self._tree.heading(col, text=col.replace("_"," ").title(),
                                command=lambda c=col: self._sort_tree(c))
             self._tree.column(col, width=w, anchor="w")
 
-        vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self._tree.yview)
+        vsb = ttk.Scrollbar(tf, orient="vertical", command=self._tree.yview)
         self._tree.configure(yscrollcommand=vsb.set)
         self._tree.pack(side="left", fill="both", expand=True)
         vsb.pack(side="right", fill="y")
@@ -594,56 +591,133 @@ class PaperScreenerApp(tk.Tk):
         self._tree.tag_configure("include", background="#EAF9F1")
         self._tree.tag_configure("exclude", background="#FDF0EF")
         self._tree.tag_configure("manual",  background="#FEF9EC")
-
         self._tree.bind("<Double-1>", self._view_repo_entry)
 
         tk.Label(f, text="Double-click a row to view full analysis",
                  bg=PALETTE["bg"], fg=PALETTE["grey_mid"],
                  font=("Helvetica", 8, "italic")).pack(pady=2)
 
-    # ── Config Tab ────────────────────────────────────────────────────────────
+    # ── Settings Tab ──────────────────────────────────────────────────────────
 
     def _build_config_tab(self):
         f = self.tab_config
-        pad = {"padx": 20, "pady": 10}
 
-        tk.Label(f, text="Anthropic API Key", bg=PALETTE["bg"],
-                 fg=PALETTE["navy"], font=("Helvetica", 11, "bold")).pack(anchor="w", **pad)
+        mf = tk.LabelFrame(f, text=" Analysis Backend ", bg=PALETTE["bg"],
+                           fg=PALETTE["navy"], font=("Helvetica", 10, "bold"),
+                           bd=1, relief="groove")
+        mf.pack(fill="x", padx=20, pady=16)
+        inner = tk.Frame(mf, bg=PALETTE["bg"])
+        inner.pack(fill="x", padx=16, pady=12)
 
-        key_frame = tk.Frame(f, bg=PALETTE["bg"])
-        key_frame.pack(fill="x", padx=20)
-        self._key_entry = tk.Entry(key_frame, textvariable=self._api_key,
-                                   font=("Courier", 10), show="•", width=60,
+        # ── Ollama section ──
+        tk.Radiobutton(inner,
+                       text="Local (Ollama)  — Free, runs entirely on your computer",
+                       variable=self._mode, value=MODE_OLLAMA,
+                       bg=PALETTE["bg"], fg=PALETTE["navy"],
+                       font=("Helvetica", 10, "bold"), selectcolor=PALETTE["amber"],
+                       activebackground=PALETTE["bg"],
+                       indicatoron=1).pack(anchor="w")
+
+        os_row = tk.Frame(inner, bg=PALETTE["bg"])
+        os_row.pack(fill="x", padx=28, pady=2)
+        self._ollama_status_label = tk.Label(
+            os_row, text="Click 'Check Status' to verify Ollama is running",
+            bg=PALETTE["bg"], fg=PALETTE["grey_mid"], font=("Helvetica", 9))
+        self._ollama_status_label.pack(side="left")
+        tk.Button(os_row, text="Check Status", command=self._check_ollama,
+                  bg=PALETTE["teal"], fg="white",
+                  font=("Helvetica", 8), relief="flat", padx=8
+                  ).pack(side="left", padx=8)
+
+        mr = tk.Frame(inner, bg=PALETTE["bg"])
+        mr.pack(fill="x", padx=28, pady=4)
+        tk.Label(mr, text="Model:", bg=PALETTE["bg"], fg=PALETTE["grey_dark"],
+                 font=("Helvetica", 9)).pack(side="left")
+        self._model_combo = ttk.Combobox(mr, textvariable=self._ollama_model,
+                                         values=OLLAMA_MODELS, width=24,
+                                         font=("Helvetica", 10))
+        self._model_combo.pack(side="left", padx=8)
+
+        tk.Label(inner, bg=PALETTE["bg"], fg=PALETTE["grey_mid"],
+                 font=("Helvetica", 8, "italic"), justify="left",
+                 text=(
+                     "First-time Ollama setup:\n"
+                     "  1. Download from https://ollama.com and install it\n"
+                     "  2. It will appear in your system tray and start automatically\n"
+                     "  3. Open Command Prompt and run:   ollama pull llama3.2\n"
+                     "     (one-time ~2 GB download — after this, analysis is free and offline)"
+                 )).pack(anchor="w", padx=28, pady=(2,10))
+
+        tk.Frame(inner, bg=PALETTE["grey_light"], height=1).pack(fill="x", pady=8)
+
+        # ── API section ──
+        tk.Radiobutton(inner,
+                       text="Anthropic API  — Higher accuracy, requires paid API credits (~$0.01-0.05/paper)",
+                       variable=self._mode, value=MODE_API,
+                       bg=PALETTE["bg"], fg=PALETTE["navy"],
+                       font=("Helvetica", 10, "bold"), selectcolor=PALETTE["amber"],
+                       activebackground=PALETTE["bg"],
+                       indicatoron=1).pack(anchor="w")
+
+        kr = tk.Frame(inner, bg=PALETTE["bg"])
+        kr.pack(fill="x", padx=28, pady=4)
+        tk.Label(kr, text="API Key:", bg=PALETTE["bg"], fg=PALETTE["grey_dark"],
+                 font=("Helvetica", 9)).pack(side="left")
+        self._key_entry = tk.Entry(kr, textvariable=self._api_key,
+                                   font=("Courier", 10), show="*", width=52,
                                    bd=1, relief="solid")
-        self._key_entry.pack(side="left", fill="x", expand=True)
-        tk.Button(key_frame, text="Show/Hide",
-                  command=self._toggle_key_vis,
+        self._key_entry.pack(side="left", padx=8)
+        tk.Button(kr, text="Show/Hide", command=self._toggle_key_vis,
                   bg=PALETTE["grey_light"], fg=PALETTE["navy"],
-                  font=("Helvetica", 9), relief="flat", padx=8
-                  ).pack(side="left", padx=6)
+                  font=("Helvetica", 8), relief="flat", padx=8).pack(side="left")
 
-        tk.Label(f, text="The API key is stored only in memory for this session and is never saved to disk.",
-                 bg=PALETTE["bg"], fg=PALETTE["grey_mid"],
-                 font=("Helvetica", 8, "italic")).pack(anchor="w", padx=20, pady=4)
+        tk.Label(inner, bg=PALETTE["bg"], fg=PALETTE["grey_mid"],
+                 font=("Helvetica", 8, "italic"),
+                 text=(
+                     "API key stored in memory only — never written to disk.\n"
+                     "Get a key: https://console.anthropic.com  -> API Keys -> Create Key\n"
+                     "Add credits: https://console.anthropic.com  -> Billing  (minimum $5)"
+                 )).pack(anchor="w", padx=28, pady=(0,8))
 
-        # Repository info
-        sep = tk.Frame(f, bg=PALETTE["grey_light"], height=1)
-        sep.pack(fill="x", padx=20, pady=16)
-
+        # ── Repo location ──
+        tk.Frame(f, bg=PALETTE["grey_light"], height=1).pack(fill="x", padx=20, pady=8)
         tk.Label(f, text="Repository Location", bg=PALETTE["bg"],
-                 fg=PALETTE["navy"], font=("Helvetica", 11, "bold")).pack(anchor="w", padx=20)
+                 fg=PALETTE["navy"], font=("Helvetica", 10, "bold")).pack(anchor="w", padx=20)
         tk.Label(f, text=str(REPO_DIR), bg=PALETTE["bg"], fg=PALETTE["teal"],
-                 font=("Courier", 9)).pack(anchor="w", padx=20, pady=4)
-        tk.Label(f, text="Files saved: paper_repository.json (full data) · paper_repository.csv (spreadsheet view)",
-                 bg=PALETTE["bg"], fg=PALETTE["grey_mid"],
-                 font=("Helvetica", 8, "italic")).pack(anchor="w", padx=20)
+                 font=("Courier", 9)).pack(anchor="w", padx=20, pady=2)
+        tk.Label(f, bg=PALETTE["bg"], fg=PALETTE["grey_mid"],
+                 font=("Helvetica", 8, "italic"),
+                 text="paper_repository.json (full data)  ·  paper_repository.csv (spreadsheet)"
+                 ).pack(anchor="w", padx=20)
 
-    # ── Actions ───────────────────────────────────────────────────────────────
+        self.after(500, self._check_ollama)
+
+    # ── Settings helpers ──────────────────────────────────────────────────────
 
     def _toggle_key_vis(self):
-        self._key_entry.config(
-            show="" if self._key_entry.cget("show") == "•" else "•"
-        )
+        self._key_entry.config(show="" if self._key_entry.cget("show") == "*" else "*")
+
+    def _check_ollama(self):
+        self._ollama_status_label.config(text="Checking…", fg=PALETTE["grey_mid"])
+        def _do():
+            running, models = check_ollama_status()
+            def _upd():
+                if running:
+                    ms = ", ".join(models) if models else "none installed yet — run: ollama pull llama3.2"
+                    self._ollama_status_label.config(
+                        text=f"Ollama is running  |  Models: {ms}", fg=PALETTE["green"])
+                    if models:
+                        self._model_combo["values"] = models
+                        if self._ollama_model.get() not in models:
+                            self._ollama_model.set(models[0])
+                else:
+                    self._ollama_status_label.config(
+                        text="Ollama not found — install from https://ollama.com",
+                        fg=PALETTE["red"])
+            self.after(0, _upd)
+        threading.Thread(target=_do, daemon=True).start()
+
+    # ── Single paper actions ──────────────────────────────────────────────────
 
     def _fetch_url(self):
         url = self._url_var.get().strip()
@@ -656,40 +730,33 @@ class PaperScreenerApp(tk.Tk):
             pdf_bytes, err = fetch_pdf_from_url(url)
             if pdf_bytes:
                 self._current_pdf_bytes = pdf_bytes
-                self._file_label.config(
-                    text=f"✓ Fetched from URL ({len(pdf_bytes)//1024} KB)",
-                    fg=PALETTE["green"])
-                self._set_progress("PDF fetched successfully.")
+                self.after(0, lambda: self._file_label.config(
+                    text=f"Fetched ({len(pdf_bytes)//1024} KB)", fg=PALETTE["green"]))
+                self.after(0, self._set_progress, "PDF fetched.")
             else:
                 self._current_pdf_bytes = None
-                self._file_label.config(
-                    text=f"✗ Could not fetch: {err[:60]}",
-                    fg=PALETTE["red"])
-                self._set_progress(f"Fetch failed — please upload PDF manually.")
-                messagebox.showwarning(
-                    "Fetch Failed",
-                    f"Could not retrieve PDF from URL:\n{err}\n\n"
-                    "Please upload the PDF file manually."
-                )
-            self._set_busy(False)
+                self.after(0, lambda: self._file_label.config(
+                    text=f"Failed: {err[:55]}", fg=PALETTE["red"]))
+                self.after(0, self._set_progress, "Fetch failed — upload PDF manually.")
+                self.after(0, messagebox.showwarning, "Fetch Failed",
+                           f"Could not retrieve PDF:\n{err}\n\nPlease upload the PDF manually.")
+            self.after(0, self._set_busy, False)
         threading.Thread(target=_do, daemon=True).start()
 
     def _upload_pdf(self):
         path = filedialog.askopenfilename(
-            title="Select PDF", filetypes=[("PDF files", "*.pdf")]
-        )
+            title="Select PDF", filetypes=[("PDF files", "*.pdf")])
         if path:
             with open(path, "rb") as fh:
                 self._current_pdf_bytes = fh.read()
             name = Path(path).name
             self._file_label.config(
-                text=f"✓ {name} ({len(self._current_pdf_bytes)//1024} KB)",
-                fg=PALETTE["green"]
-            )
-            self._set_progress(f"PDF loaded: {name}")
+                text=f"{name} ({len(self._current_pdf_bytes)//1024} KB)",
+                fg=PALETTE["green"])
+            self._set_progress(f"Loaded: {name}")
 
     def _run_single_analysis(self):
-        if not self._validate_ready():
+        if not self._validate_ready(need_pdf=True):
             return
         paper_id = self._meta_vars["Paper ID *"].get().strip()
         if not paper_id:
@@ -697,85 +764,84 @@ class PaperScreenerApp(tk.Tk):
             return
         self._set_busy(True)
         self._set_progress("Starting analysis…")
-        threading.Thread(target=self._analysis_worker,
-                         args=(paper_id,), daemon=True).start()
+        threading.Thread(target=self._analysis_worker, args=(paper_id,), daemon=True).start()
 
     def _analysis_worker(self, paper_id: str):
+        mode  = self._mode.get()
+        model = self._ollama_model.get()
+        key   = self._api_key.get().strip()
         try:
-            result = analyze_paper_with_claude(
-                self._current_pdf_bytes,
-                self._api_key.get().strip(),
-                progress_callback=self._set_progress
-            )
-            entry = self._build_repo_entry(paper_id, result)
+            result = analyze_paper(
+                self._current_pdf_bytes, mode=mode, api_key=key, ollama_model=model,
+                progress_callback=lambda m: self.after(0, self._set_progress, m))
+            entry = self._build_repo_entry(paper_id, result, mode, model)
             save_to_repository(entry)
             self.after(0, self._display_result, result, paper_id)
             self.after(0, self._refresh_repository_tab)
-            self.after(0, self._set_progress, "✓ Analysis complete — saved to repository.")
-        except json.JSONDecodeError as e:
+            self.after(0, self._set_progress, "Analysis complete — saved to repository.")
+        except ConnectionError as e:
+            self.after(0, messagebox.showerror, "Ollama Not Running", str(e))
+            self.after(0, self._set_progress, "Failed.")
+        except json.JSONDecodeError:
             self.after(0, messagebox.showerror, "Parse Error",
-                       f"Claude returned non-JSON output:\n{e}")
-            self.after(0, self._set_progress, "Analysis failed.")
+                       "The model returned an unexpected response format.\n"
+                       "Try again, or switch to Anthropic API in Settings for more reliable output.")
+            self.after(0, self._set_progress, "Failed.")
         except Exception as e:
             self.after(0, messagebox.showerror, "Error", str(e))
-            self.after(0, self._set_progress, "Analysis failed.")
+            self.after(0, self._set_progress, "Failed.")
         finally:
             self.after(0, self._set_busy, False)
 
-    def _build_repo_entry(self, paper_id: str, result: dict) -> dict:
-        criteria = result.get("criteria", {})
-        genai    = criteria.get("genai_used", {})
-        domain   = criteria.get("relevant_domain", {})
-        qa       = criteria.get("quality_assurance", {})
+    def _build_repo_entry(self, paper_id, result, mode, model):
+        c  = result.get("criteria", {})
+        gn = c.get("genai_used", {})
+        dm = c.get("relevant_domain", {})
+        qa = c.get("quality_assurance", {})
         return {
-            "paper_id":           paper_id,
-            "title":              self._meta_vars["Title"].get().strip(),
-            "authors":            self._meta_vars["Authors"].get().strip(),
-            "year":               self._meta_vars["Year"].get().strip(),
-            "url":                self._url_var.get().strip(),
-            "file_path":          "",
-            "recommendation":     result.get("overall_recommendation", ""),
-            "confidence":         result.get("confidence_level", ""),
-            "genai_used":         genai.get("verdict", ""),
-            "relevant_domain":    domain.get("verdict", ""),
-            "quality_assurance":  qa.get("verdict", ""),
-            "domains_identified": "; ".join(domain.get("domains_identified", [])),
-            "metrics_identified": "; ".join(qa.get("metrics_identified", [])),
-            "key_decision_factors": result.get("key_decision_factors", ""),
-            "additional_notes":   result.get("additional_notes", ""),
-            "analyzed_at":        datetime.datetime.now().isoformat(timespec="seconds"),
-            "full_json_path":     "",
-            "_full_result":       result,
+            "paper_id":            paper_id,
+            "title":               self._meta_vars["Title"].get().strip(),
+            "authors":             self._meta_vars["Authors"].get().strip(),
+            "year":                self._meta_vars["Year"].get().strip(),
+            "url":                 self._url_var.get().strip(),
+            "file_path":           "",
+            "recommendation":      result.get("overall_recommendation",""),
+            "confidence":          result.get("confidence_level",""),
+            "genai_used":          gn.get("verdict",""),
+            "relevant_domain":     dm.get("verdict",""),
+            "quality_assurance":   qa.get("verdict",""),
+            "domains_identified":  "; ".join(dm.get("domains_identified",[])),
+            "metrics_identified":  "; ".join(qa.get("metrics_identified",[])),
+            "key_decision_factors":result.get("key_decision_factors",""),
+            "additional_notes":    result.get("additional_notes",""),
+            "analyzed_at":         datetime.datetime.now().isoformat(timespec="seconds"),
+            "backend_used":        "API" if mode == MODE_API else "Ollama",
+            "model_used":          "claude-opus-4-5" if mode == MODE_API else model,
+            "_full_result":        result,
         }
 
-    def _display_result(self, result: dict, paper_id: str):
-        rec  = result.get("overall_recommendation", "?")
-        conf = result.get("confidence_level", "?")
-        crit = result.get("criteria", {})
-
-        rec_tag = {"INCLUDE": "include", "EXCLUDE": "exclude",
-                   "MANUAL_REVIEW": "manual"}.get(rec, "")
-        verdict_tag = {"YES": "yes", "NO": "no", "UNCLEAR": "unclear"}
+    def _display_result(self, result, paper_id):
+        rec  = result.get("overall_recommendation","?")
+        conf = result.get("confidence_level","?")
+        crit = result.get("criteria",{})
+        rtag = {"INCLUDE":"include","EXCLUDE":"exclude","MANUAL_REVIEW":"manual"}.get(rec,"")
+        vtag = {"YES":"yes","NO":"no","UNCLEAR":"unclear"}
 
         lines = []
-        def w(text, tag=None):
-            lines.append((text, tag))
+        def w(text, tag=None): lines.append((text, tag))
 
-        w("━" * 70)
-        w(f"  PAPER: {paper_id}", "heading")
-        w(f"  RECOMMENDATION:  {rec}", rec_tag)
-        w(f"  CONFIDENCE:      {conf}")
-        w("━" * 70)
+        w("="*68); w(f"  PAPER: {paper_id}", "heading")
+        w(f"  RECOMMENDATION:  {rec}", rtag)
+        w(f"  CONFIDENCE:      {conf}"); w("="*68)
 
         for key, label in [
-            ("genai_used",        "Criterion 1: GenAI Used"),
-            ("relevant_domain",   "Criterion 2: Relevant Assessment Domain"),
-            ("quality_assurance", "Criterion 3: Quality Assurance"),
+            ("genai_used","Criterion 1: GenAI Used"),
+            ("relevant_domain","Criterion 2: Relevant Assessment Domain"),
+            ("quality_assurance","Criterion 3: Quality Assurance"),
         ]:
-            c = crit.get(key, {})
-            v = c.get("verdict", "?")
-            w(f"\n▸ {label}", "heading")
-            w(f"  Verdict: {v}", verdict_tag.get(v))
+            c = crit.get(key,{})
+            v = c.get("verdict","?")
+            w(f"\n  {label}", "heading"); w(f"  Verdict: {v}", vtag.get(v))
             if key == "relevant_domain" and c.get("domains_identified"):
                 w(f"  Domains: {', '.join(c['domains_identified'])}")
             if key == "quality_assurance" and c.get("metrics_identified"):
@@ -786,243 +852,203 @@ class PaperScreenerApp(tk.Tk):
             if c.get("location"):
                 w(f"  Location:  {c['location']}")
 
-        w("\n▸ Key Decision Factors", "heading")
-        w(f"  {result.get('key_decision_factors','')}")
+        w("\n  Key Decision Factors", "heading"); w(f"  {result.get('key_decision_factors','')}")
         if result.get("confidence_rationale"):
-            w(f"\n▸ Confidence Rationale", "heading")
-            w(f"  {result.get('confidence_rationale','')}")
+            w("\n  Confidence Rationale","heading"); w(f"  {result.get('confidence_rationale','')}")
         if result.get("additional_notes"):
-            w(f"\n▸ Additional Notes", "heading")
-            w(f"  {result.get('additional_notes','')}")
-        w("\n" + "━" * 70)
+            w("\n  Additional Notes","heading"); w(f"  {result.get('additional_notes','')}")
+        w("\n" + "="*68)
 
         self._result_text.configure(state="normal")
-        self._result_text.delete("1.0", "end")
+        self._result_text.delete("1.0","end")
         for text, tag in lines:
-            if tag:
-                self._result_text.insert("end", text + "\n", tag)
-            else:
-                self._result_text.insert("end", text + "\n")
+            if tag: self._result_text.insert("end", text+"\n", tag)
+            else:   self._result_text.insert("end", text+"\n")
         self._result_text.configure(state="disabled")
 
-    # ── Batch ─────────────────────────────────────────────────────────────────
+    # ── Batch actions ─────────────────────────────────────────────────────────
 
     def _download_batch_template(self):
         dest = filedialog.asksaveasfilename(
-            defaultextension=".csv",
-            filetypes=[("CSV", "*.csv")],
-            initialfile="batch_papers_template.csv"
-        )
+            defaultextension=".csv", filetypes=[("CSV","*.csv")],
+            initialfile="batch_papers_template.csv")
         if dest:
-            import shutil
-            shutil.copy(BATCH_TEMPLATE_CSV, dest)
-            messagebox.showinfo("Template Saved", f"Template saved to:\n{dest}")
+            import shutil; shutil.copy(BATCH_TEMPLATE_CSV, dest)
+            messagebox.showinfo("Saved", f"Template saved to:\n{dest}")
 
     def _select_batch_csv(self):
         path = filedialog.askopenfilename(
-            title="Select Batch CSV", filetypes=[("CSV files", "*.csv")]
-        )
+            title="Select Batch CSV", filetypes=[("CSV files","*.csv")])
         if path:
             self._batch_csv_path = path
-            self._batch_file_label.config(
-                text=Path(path).name, fg=PALETTE["navy"]
-            )
+            self._batch_file_label.config(text=Path(path).name, fg=PALETTE["navy"])
             self._batch_run_btn.config(state="normal")
 
     def _run_batch_analysis(self):
-        if not self._batch_csv_path:
-            return
-        if not self._validate_ready():
-            return
+        if not self._batch_csv_path: return
+        if not self._validate_ready(need_pdf=False): return
         self._set_busy(True)
-        self._batch_log.delete("1.0", "end")
+        self._batch_log.delete("1.0","end")
         threading.Thread(target=self._batch_worker, daemon=True).start()
 
     def _batch_worker(self):
+        mode  = self._mode.get()
+        model = self._ollama_model.get()
+        key   = self._api_key.get().strip()
+        rows = []
         try:
-            rows = []
-            with open(self._batch_csv_path, newline="", encoding="utf-8") as f:
-                reader = csv.DictReader(f)
-                rows = list(reader)
-
-            total = len(rows)
-            self.after(0, self._batch_log.insert, "end",
-                       f"Loaded {total} papers from CSV.\n", "info")
-            self._batch_progress["maximum"] = total
-
-            for i, row in enumerate(rows):
-                paper_id  = row.get("paper_id", f"PAPER_{i+1}").strip()
-                url       = row.get("url", "").strip()
-                file_path = row.get("file_path", "").strip()
-
-                self.after(0, self._batch_log.insert, "end",
-                           f"\n[{i+1}/{total}] {paper_id} — ", "info")
-
-                pdf_bytes = None
-
-                # Try local file first
-                if file_path and os.path.isfile(file_path):
-                    with open(file_path, "rb") as fh:
-                        pdf_bytes = fh.read()
-                    self.after(0, self._batch_log.insert, "end",
-                               "loaded from file. ", "ok")
-                elif url:
-                    self.after(0, self._batch_log.insert, "end",
-                               "fetching from URL… ", "info")
-                    pdf_bytes, err = fetch_pdf_from_url(url)
-                    if pdf_bytes:
-                        self.after(0, self._batch_log.insert, "end",
-                                   "fetched. ", "ok")
-                    else:
-                        self.after(0, self._batch_log.insert, "end",
-                                   f"FETCH FAILED ({err[:40]}). Skipping.\n", "err")
-                        self.after(0, self._batch_progress.__setitem__, "value", i+1)
-                        continue
-                else:
-                    self.after(0, self._batch_log.insert, "end",
-                               "No source found. Skipping.\n", "err")
-                    self.after(0, self._batch_progress.__setitem__, "value", i+1)
-                    continue
-
+            # Try encodings in order: UTF-8 with BOM (Excel default),
+            # Latin-1 (Windows Western European), plain UTF-8 with replacement
+            for enc in ("utf-8-sig", "latin-1", "cp1252"):
                 try:
-                    self.after(0, self._batch_log.insert, "end", "Analyzing… ", "info")
-                    result = analyze_paper_with_claude(
-                        pdf_bytes, self._api_key.get().strip()
-                    )
-                    rec = result.get("overall_recommendation", "?")
-                    rec_tag = {"INCLUDE": "ok", "EXCLUDE": "err",
-                               "MANUAL_REVIEW": "info"}.get(rec, "info")
-
-                    entry = {
-                        "paper_id":    paper_id,
-                        "title":       row.get("title", ""),
-                        "authors":     row.get("authors", ""),
-                        "year":        row.get("year", ""),
-                        "url":         url,
-                        "file_path":   file_path,
-                        "recommendation": rec,
-                        "confidence":  result.get("confidence_level", ""),
-                        "genai_used":  result.get("criteria", {}).get("genai_used", {}).get("verdict", ""),
-                        "relevant_domain": result.get("criteria", {}).get("relevant_domain", {}).get("verdict", ""),
-                        "quality_assurance": result.get("criteria", {}).get("quality_assurance", {}).get("verdict", ""),
-                        "domains_identified": "; ".join(
-                            result.get("criteria", {}).get("relevant_domain", {}).get("domains_identified", [])),
-                        "metrics_identified": "; ".join(
-                            result.get("criteria", {}).get("quality_assurance", {}).get("metrics_identified", [])),
-                        "key_decision_factors": result.get("key_decision_factors", ""),
-                        "additional_notes": result.get("additional_notes", ""),
-                        "analyzed_at": datetime.datetime.now().isoformat(timespec="seconds"),
-                        "full_json_path": "",
-                        "_full_result": result,
-                    }
-                    save_to_repository(entry)
-                    self.after(0, self._batch_log.insert, "end",
-                               f"→ {rec}\n", rec_tag)
-                except Exception as e:
-                    self.after(0, self._batch_log.insert, "end",
-                               f"ERROR: {e}\n", "err")
-
-                self.after(0, self._batch_progress.__setitem__, "value", i+1)
-
-            self.after(0, self._batch_log.insert, "end",
-                       f"\n✓ Batch complete. Repository updated.\n", "ok")
-            self.after(0, self._refresh_repository_tab)
+                    with open(self._batch_csv_path, newline="", encoding=enc) as f:
+                        rows = list(csv.DictReader(f))
+                    self._log_batch(f"(Detected encoding: {enc})\n", "info")
+                    break
+                except UnicodeDecodeError:
+                    continue
+            else:
+                with open(self._batch_csv_path, newline="",
+                          encoding="utf-8", errors="replace") as f:
+                    rows = list(csv.DictReader(f))
+                self._log_batch("(Used fallback encoding — some characters may be replaced)\n","info")
         except Exception as e:
-            self.after(0, self._batch_log.insert, "end",
-                       f"\nFATAL ERROR: {e}\n", "err")
-        finally:
-            self.after(0, self._set_busy, False)
+            self._log_batch(f"Could not read CSV: {e}\n","err")
+            self.after(0, self._set_busy, False); return
 
-    # ── Repository display ────────────────────────────────────────────────────
+        total = len(rows)
+        self._log_batch(f"Loaded {total} papers.\n","info")
+        self._batch_progress["maximum"] = total
+
+        for i, row in enumerate(rows):
+            pid  = row.get("paper_id", f"PAPER_{i+1}").strip()
+            url  = row.get("url","").strip()
+            fp   = row.get("file_path","").strip()
+            self._log_batch(f"\n[{i+1}/{total}] {pid} — ","info")
+
+            pdf_bytes = None
+            if fp and os.path.isfile(fp):
+                with open(fp,"rb") as fh: pdf_bytes = fh.read()
+                self._log_batch("loaded from file. ","ok")
+            elif url:
+                self._log_batch("fetching URL… ","info")
+                pdf_bytes, err = fetch_pdf_from_url(url)
+                if pdf_bytes: self._log_batch("fetched. ","ok")
+                else:
+                    self._log_batch(f"FAILED ({err[:40]}). Skipping.\n","err")
+                    self.after(0, self._batch_progress.__setitem__, "value", i+1); continue
+            else:
+                self._log_batch("No source. Skipping.\n","err")
+                self.after(0, self._batch_progress.__setitem__, "value", i+1); continue
+
+            try:
+                self._log_batch("Analyzing… ","info")
+                result = analyze_paper(pdf_bytes, mode=mode, api_key=key, ollama_model=model)
+                rec  = result.get("overall_recommendation","?")
+                rtag = {"INCLUDE":"ok","EXCLUDE":"err","MANUAL_REVIEW":"info"}.get(rec,"info")
+                c    = result.get("criteria",{})
+                entry = {
+                    "paper_id": pid, "title": row.get("title",""),
+                    "authors": row.get("authors",""), "year": row.get("year",""),
+                    "url": url, "file_path": fp,
+                    "recommendation": rec,
+                    "confidence": result.get("confidence_level",""),
+                    "genai_used":        c.get("genai_used",{}).get("verdict",""),
+                    "relevant_domain":   c.get("relevant_domain",{}).get("verdict",""),
+                    "quality_assurance": c.get("quality_assurance",{}).get("verdict",""),
+                    "domains_identified": "; ".join(c.get("relevant_domain",{}).get("domains_identified",[])),
+                    "metrics_identified": "; ".join(c.get("quality_assurance",{}).get("metrics_identified",[])),
+                    "key_decision_factors": result.get("key_decision_factors",""),
+                    "additional_notes": result.get("additional_notes",""),
+                    "analyzed_at": datetime.datetime.now().isoformat(timespec="seconds"),
+                    "backend_used": "API" if mode == MODE_API else "Ollama",
+                    "model_used": "claude-opus-4-5" if mode == MODE_API else model,
+                    "_full_result": result,
+                }
+                save_to_repository(entry)
+                self._log_batch(f"-> {rec}\n", rtag)
+            except ConnectionError as e:
+                self._log_batch(f"OLLAMA ERROR: {str(e)[:80]}\n","err")
+            except Exception as e:
+                self._log_batch(f"ERROR: {e}\n","err")
+
+            self.after(0, self._batch_progress.__setitem__, "value", i+1)
+
+        self._log_batch(f"\nBatch complete. Repository updated.\n","ok")
+        self.after(0, self._refresh_repository_tab)
+        self.after(0, self._set_busy, False)
+
+    def _log_batch(self, msg, tag=""):
+        def _do():
+            self._batch_log.insert("end", msg, tag)
+            self._batch_log.see("end")
+        self.after(0, _do)
+
+    # ── Repository ────────────────────────────────────────────────────────────
 
     def _refresh_repository_tab(self):
+        if not hasattr(self,"_tree"): return
         repo  = load_repository()
-        query = self._filter_var.get().lower() if hasattr(self, "_filter_var") else ""
-        rec_f = self._rec_filter.get() if hasattr(self, "_rec_filter") else "All"
-
-        for item in self._tree.get_children():
-            self._tree.delete(item)
-
+        query = self._filter_var.get().lower() if hasattr(self,"_filter_var") else ""
+        rec_f = self._rec_filter.get() if hasattr(self,"_rec_filter") else "All"
+        for item in self._tree.get_children(): self._tree.delete(item)
         for r in repo:
-            rec = r.get("recommendation", "")
-            if rec_f != "All" and rec != rec_f:
-                continue
-            if query and query not in json.dumps(r).lower():
-                continue
-
-            tag = {"INCLUDE": "include", "EXCLUDE": "exclude",
-                   "MANUAL_REVIEW": "manual"}.get(rec, "")
-            ts  = r.get("analyzed_at", "")[:16].replace("T", " ")
-            self._tree.insert("", "end", iid=r.get("paper_id"),
+            rec = r.get("recommendation","")
+            if rec_f != "All" and rec != rec_f: continue
+            if query and query not in json.dumps(r).lower(): continue
+            tag = {"INCLUDE":"include","EXCLUDE":"exclude","MANUAL_REVIEW":"manual"}.get(rec,"")
+            ts  = r.get("analyzed_at","")[:16].replace("T"," ")
+            self._tree.insert("","end", iid=r.get("paper_id"),
                               values=(r.get("paper_id",""), r.get("title",""),
-                                      r.get("year",""), rec,
-                                      r.get("confidence",""), ts),
+                                      r.get("year",""), rec, r.get("confidence",""),
+                                      r.get("backend_used",""), ts),
                               tags=(tag,))
 
     def _sort_tree(self, col):
-        rows = [(self._tree.set(k, col), k) for k in self._tree.get_children("")]
+        rows = [(self._tree.set(k,col), k) for k in self._tree.get_children("")]
         rows.sort()
-        for i, (_, k) in enumerate(rows):
-            self._tree.move(k, "", i)
+        for i,(_,k) in enumerate(rows): self._tree.move(k,"",i)
 
-    def _view_repo_entry(self, _event):
+    def _view_repo_entry(self, _=None):
         sel = self._tree.selection()
-        if not sel:
-            return
-        paper_id = sel[0]
-        repo = load_repository()
-        entry = next((r for r in repo if r.get("paper_id") == paper_id), None)
-        if not entry:
-            return
-
+        if not sel: return
+        repo  = load_repository()
+        entry = next((r for r in repo if r.get("paper_id")==sel[0]), None)
+        if not entry: return
         win = tk.Toplevel(self)
-        win.title(f"Paper Detail — {paper_id}")
-        win.geometry("800x620")
+        win.title(f"Paper Detail — {sel[0]}")
+        win.geometry("820x640")
         win.configure(bg=PALETTE["bg"])
-
-        tk.Label(win, text=f"{paper_id}  ·  {entry.get('title','(no title)')}",
+        tk.Label(win, text=f"{sel[0]}  |  {entry.get('title','(no title)')}",
                  bg=PALETTE["navy"], fg=PALETTE["amber"],
-                 font=("Georgia", 12, "bold"), padx=12, pady=8).pack(fill="x")
-
-        txt = scrolledtext.ScrolledText(
-            win, font=("Courier", 9), bg="#1e2636", fg="#c8d8f0",
-            bd=0, padx=12, pady=10, wrap="word"
-        )
+                 font=("Georgia", 11, "bold"), padx=12, pady=8).pack(fill="x")
+        txt = scrolledtext.ScrolledText(win, font=("Courier", 9), bg="#1e2636",
+                                        fg="#c8d8f0", bd=0, padx=12, pady=10, wrap="word")
         txt.pack(fill="both", expand=True, padx=12, pady=12)
-
-        full = entry.get("_full_result", {})
-        if full:
-            txt.insert("end", json.dumps(full, indent=2))
-        else:
-            txt.insert("end", json.dumps(
-                {k: v for k, v in entry.items() if k != "_full_result"}, indent=2
-            ))
+        full = entry.get("_full_result",{})
+        display = full if full else {k:v for k,v in entry.items() if k!="_full_result"}
+        txt.insert("end", json.dumps(display, indent=2))
         txt.configure(state="disabled")
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
-    def _validate_ready(self) -> bool:
-        if not self._api_key.get().strip():
-            messagebox.showwarning(
-                "API Key Required",
-                "Please enter your Anthropic API key in the Settings tab."
-            )
-            self.notebook.select(self.tab_config)
-            return False
-        if not self._current_pdf_bytes and not hasattr(self, "_batch_csv_path"):
-            messagebox.showwarning(
-                "No Paper Loaded",
-                "Please fetch a PDF from a URL or upload a PDF file first."
-            )
+    def _validate_ready(self, need_pdf=True):
+        if self._mode.get() == MODE_API and not self._api_key.get().strip():
+            messagebox.showwarning("API Key Required",
+                                   "Please enter your Anthropic API key in the Settings tab.")
+            self.notebook.select(self.tab_config); return False
+        if need_pdf and not self._current_pdf_bytes:
+            messagebox.showwarning("No PDF", "Please fetch or upload a PDF first.")
             return False
         return True
 
-    def _set_busy(self, busy: bool):
+    def _set_busy(self, busy):
         self._busy = busy
         state = "disabled" if busy else "normal"
         self._analyze_btn.config(state=state)
+        self._batch_run_btn.config(state=state)
 
-    def _set_progress(self, msg: str):
+    def _set_progress(self, msg):
         self._progress_label.config(text=msg)
 
 
