@@ -73,7 +73,7 @@ CSV_COLUMNS = [
 BATCH_CSV_COLUMNS = ["paper_id", "title", "authors", "year", "url", "file_path"]
 
 SYSTEM_PROMPT = """You are a systematic literature review screener for the GenAI Evidence Hub,
-a research initiative examining generative AI in educational assessment contexts. Your job is 
+a research initiative examining generative AI in educational assessment contexts. Your job is
 to evaluate whether a research paper meets the inclusion criteria for this meta-analysis.
 
 You must evaluate each paper against ALL THREE criteria and provide a structured JSON response.
@@ -222,28 +222,39 @@ def fetch_pdf_from_url(url: str):
 # ── Analysis backends ─────────────────────────────────────────────────────────
 
 def _clean_json(raw: str) -> dict:
-    """Strip markdown fences and extract the JSON object."""
+    # Strip markdown fences and extract the first complete JSON object
     raw = raw.strip()
-    raw = re.sub(r"^```json\s*", "", raw)
-    raw = re.sub(r"^```\s*",     "", raw)
-    raw = re.sub(r"\s*```$",     "", raw)
+    raw = re.sub(r"^```json\s*", "", raw, flags=re.MULTILINE)
+    raw = re.sub(r"^```\s*",     "", raw, flags=re.MULTILINE)
+    raw = re.sub(r"\s*```$",     "", raw, flags=re.MULTILINE)
+    raw = raw.strip()
     start, end = raw.find("{"), raw.rfind("}")
     if start != -1 and end != -1:
         raw = raw[start:end+1]
+    if not raw:
+        raise json.JSONDecodeError("Empty response from model", "", 0)
     return json.loads(raw)
 
 
-def _user_prompt_from_text(text: str) -> str:
+def _user_prompt_from_text(text: str, truncate: int = 80000) -> str:
+    # Build user message; truncate long papers to avoid overwhelming small models
+    truncated = text[:truncate]
+    note = (
+        f"\n[NOTE: Paper truncated to {truncate} chars for processing.]"
+        if len(text) > truncate else ""
+    )
     return (
         "Evaluate the following research paper against the GenAI Evidence Hub "
         "inclusion criteria. Read carefully before deciding.\n\n"
-        "Return ONLY valid JSON — no markdown fences, no preamble.\n\n"
-        f"--- PAPER TEXT ---\n{text[:120000]}"
+        "IMPORTANT: Respond with ONLY a valid JSON object. "
+        "Start your response with { and end with }. "
+        "No prose, no markdown fences, no explanation outside the JSON.\n\n"
+        f"--- PAPER TEXT ---\n{truncated}{note}"
     )
 
 
 def check_ollama_status():
-    """Returns (is_running: bool, installed_models: list[str])."""
+    # Returns (is_running: bool, installed_models: list[str])
     try:
         resp = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=3)
         models = [m["name"].split(":")[0] for m in resp.json().get("models", [])]
@@ -252,48 +263,85 @@ def check_ollama_status():
         return False, []
 
 
-def analyze_with_ollama(pdf_bytes: bytes, model: str, progress_callback=None) -> dict:
+def analyze_with_ollama(pdf_bytes: bytes, model: str,
+                        progress_callback=None, stop_flag=None) -> dict:
     if progress_callback:
-        progress_callback("Extracting text from PDF…")
+        progress_callback("Extracting text from PDF...")
     text = extract_text_from_pdf_bytes(pdf_bytes)
     if not text.strip():
         raise ValueError(
             "No extractable text found in the PDF.\n"
             "The file may be a scanned image. Please try a text-based PDF."
         )
-    if progress_callback:
-        progress_callback(f"Sending to local model ({model})… may take 1–3 min on CPU.")
 
-    payload = {
-        "model": model, "stream": False,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user",   "content": _user_prompt_from_text(text)},
-        ],
-        "options": {"temperature": 0.1, "num_predict": 4096},
-    }
-    try:
-        resp = requests.post(f"{OLLAMA_BASE_URL}/api/chat", json=payload, timeout=600)
-        resp.raise_for_status()
-    except requests.exceptions.ConnectionError:
-        raise ConnectionError(
-            "Cannot connect to Ollama.\n\n"
-            "To fix this:\n"
-            "  1. Download Ollama from https://ollama.com\n"
-            "  2. Install and open it — it runs in the system tray\n"
-            "  3. Open Command Prompt and run:  ollama pull llama3.2\n"
-            "     (one-time ~2 GB download)\n"
-            "  4. Then click Analyze again"
-        )
-    raw = resp.json().get("message", {}).get("content", "")
-    return _clean_json(raw)
+    # Progressive truncation: try 60k chars first, then 40k, then 25k.
+    # Empty responses from Ollama almost always mean the context window was exceeded.
+    TRUNCATE_STEPS = [60000, 40000, 25000]
+    last_err = None
+
+    for truncate in TRUNCATE_STEPS:
+        if stop_flag and stop_flag():
+            raise InterruptedError("Stopped by user.")
+
+        chars_note = f"{truncate//1000}k chars"
+        if progress_callback:
+            label = "full text" if truncate == TRUNCATE_STEPS[0] else f"retrying at {chars_note}"
+            progress_callback(f"Sending to {model} ({label})… may take 1–5 min on CPU.")
+
+        payload = {
+            "model": model, "stream": False,
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user",   "content": _user_prompt_from_text(text, truncate=truncate)},
+            ],
+            "options": {"temperature": 0.1, "num_predict": 8192},
+        }
+        try:
+            resp = requests.post(
+                f"{OLLAMA_BASE_URL}/api/chat", json=payload, timeout=900
+            )
+            resp.raise_for_status()
+        except requests.exceptions.ConnectionError:
+            raise ConnectionError(
+                "Cannot connect to Ollama.\n\n"
+                "To fix this:\n"
+                "  1. Download Ollama from https://ollama.com\n"
+                "  2. Install and open it — it runs in the system tray\n"
+                "  3. Open Command Prompt and run:  ollama pull llama3.2\n"
+                "     (one-time ~2 GB download)\n"
+                "  4. Then click Analyze again"
+            )
+
+        raw = resp.json().get("message", {}).get("content", "").strip()
+
+        if not raw:
+            last_err = ValueError(
+                f"Model returned empty response at {chars_note}. "
+                "Retrying with shorter text..."
+            )
+            if progress_callback:
+                progress_callback(f"Empty response at {chars_note} — trying shorter excerpt…")
+            continue
+
+        try:
+            return _clean_json(raw)
+        except json.JSONDecodeError as e:
+            preview = raw[:200].replace("\n", " ")
+            last_err = ValueError(
+                f"Could not parse JSON at {chars_note}.\n"
+                f"Parse error: {e.msg}\n"
+                f"Response preview: {preview}"
+            )
+            continue
+
+    raise last_err or ValueError("All truncation attempts failed.")
 
 
 def analyze_with_api(pdf_bytes: bytes, api_key: str, progress_callback=None) -> dict:
     if not ANTHROPIC_AVAILABLE:
         raise ImportError("Run:  pip install anthropic")
     if progress_callback:
-        progress_callback("Sending PDF to Claude API…")
+        progress_callback("Sending PDF to Claude API...")
     client  = _anthropic_sdk.Anthropic(api_key=api_key)
     pdf_b64 = base64.standard_b64encode(pdf_bytes).decode("utf-8")
     response = client.messages.create(
@@ -310,10 +358,11 @@ def analyze_with_api(pdf_bytes: bytes, api_key: str, progress_callback=None) -> 
 
 
 def analyze_paper(pdf_bytes: bytes, mode: str, api_key: str = "",
-                  ollama_model: str = DEFAULT_MODEL, progress_callback=None) -> dict:
+                  ollama_model: str = DEFAULT_MODEL, progress_callback=None,
+                  stop_flag=None) -> dict:
     if mode == MODE_API:
         return analyze_with_api(pdf_bytes, api_key, progress_callback)
-    return analyze_with_ollama(pdf_bytes, ollama_model, progress_callback)
+    return analyze_with_ollama(pdf_bytes, ollama_model, progress_callback, stop_flag)
 
 
 # ── GUI ───────────────────────────────────────────────────────────────────────
@@ -333,6 +382,7 @@ class PaperScreenerApp(tk.Tk):
         self._current_pdf_bytes = None
         self._batch_csv_path    = None
         self._busy = False
+        self._stop_requested = False
 
         self._build_ui()
         self._refresh_repository_tab()
@@ -506,6 +556,14 @@ class PaperScreenerApp(tk.Tk):
             font=("Helvetica", 10, "bold"), relief="flat",
             padx=16, pady=6, cursor="hand2", state="disabled")
         self._batch_run_btn.pack(side="right")
+
+        self._batch_stop_btn = tk.Button(
+            ctrl, text="⏹  Stop",
+            command=self._stop_batch,
+            bg=PALETTE["red"], fg="white",
+            font=("Helvetica", 10, "bold"), relief="flat",
+            padx=12, pady=6, cursor="hand2", state="disabled")
+        self._batch_stop_btn.pack(side="right", padx=6)
 
         pf = tk.Frame(f, bg=PALETTE["bg"])
         pf.pack(fill="x", padx=16)
@@ -886,9 +944,15 @@ class PaperScreenerApp(tk.Tk):
     def _run_batch_analysis(self):
         if not self._batch_csv_path: return
         if not self._validate_ready(need_pdf=False): return
+        self._stop_requested = False
         self._set_busy(True)
         self._batch_log.delete("1.0","end")
         threading.Thread(target=self._batch_worker, daemon=True).start()
+
+    def _stop_batch(self):
+        self._stop_requested = True
+        self._batch_stop_btn.config(state="disabled", text="Stopping…")
+        self._log_batch("\n⏹ Stop requested — finishing current paper then halting.\n", "info")
 
     def _batch_worker(self):
         mode  = self._mode.get()
@@ -920,9 +984,16 @@ class PaperScreenerApp(tk.Tk):
         self._batch_progress["maximum"] = total
 
         for i, row in enumerate(rows):
+            # Check stop flag between each paper
+            if self._stop_requested:
+                self._log_batch(f"\n⏹ Batch stopped after {i} of {total} papers.\n", "info")
+                break
+
             pid  = row.get("paper_id", f"PAPER_{i+1}").strip()
             url  = row.get("url","").strip()
-            fp   = row.get("file_path","").strip()
+            # Normalise path: strip surrounding whitespace and convert any
+            # Windows backslashes so the path works on the current OS
+            fp   = row.get("file_path","").strip().replace("\\", os.sep).replace("/", os.sep)
             self._log_batch(f"\n[{i+1}/{total}] {pid} — ","info")
 
             pdf_bytes = None
@@ -942,7 +1013,11 @@ class PaperScreenerApp(tk.Tk):
 
             try:
                 self._log_batch("Analyzing… ","info")
-                result = analyze_paper(pdf_bytes, mode=mode, api_key=key, ollama_model=model)
+                result = analyze_paper(
+                    pdf_bytes, mode=mode, api_key=key, ollama_model=model,
+                    progress_callback=lambda m: self._log_batch(f"  [{m}]\n", "info"),
+                    stop_flag=lambda: self._stop_requested,
+                )
                 rec  = result.get("overall_recommendation","?")
                 rtag = {"INCLUDE":"ok","EXCLUDE":"err","MANUAL_REVIEW":"info"}.get(rec,"info")
                 c    = result.get("criteria",{})
@@ -966,8 +1041,13 @@ class PaperScreenerApp(tk.Tk):
                 }
                 save_to_repository(entry)
                 self._log_batch(f"-> {rec}\n", rtag)
+            except InterruptedError:
+                self._log_batch("stopped.\n", "info")
+                break
             except ConnectionError as e:
                 self._log_batch(f"OLLAMA ERROR: {str(e)[:80]}\n","err")
+            except ValueError as e:
+                self._log_batch(f"ERROR: {e}\n","err")
             except Exception as e:
                 self._log_batch(f"ERROR: {e}\n","err")
 
@@ -1045,7 +1125,12 @@ class PaperScreenerApp(tk.Tk):
         self._busy = busy
         state = "disabled" if busy else "normal"
         self._analyze_btn.config(state=state)
-        self._batch_run_btn.config(state=state)
+        self._batch_run_btn.config(state="disabled" if busy else
+                                   ("normal" if self._batch_csv_path else "disabled"))
+        self._batch_stop_btn.config(
+            state="normal" if busy else "disabled",
+            text="⏹  Stop"
+        )
 
     def _set_progress(self, msg):
         self._progress_label.config(text=msg)
