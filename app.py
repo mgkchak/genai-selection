@@ -383,6 +383,11 @@ class PaperScreenerApp(tk.Tk):
         self._batch_csv_path    = None
         self._busy = False
         self._stop_requested = False
+        # Timer state
+        self._single_start_time  = None
+        self._batch_start_time   = None
+        self._paper_start_time   = None
+        self._timer_after_id     = None
 
         self._build_ui()
         self._refresh_repository_tab()
@@ -494,9 +499,26 @@ class PaperScreenerApp(tk.Tk):
             font=("Helvetica", 11, "bold"), relief="flat",
             padx=20, pady=8, cursor="hand2")
         self._analyze_btn.pack(side="left")
-        self._progress_label = tk.Label(btn_row, text="", bg=PALETTE["bg"],
-                                        fg=PALETTE["teal"], font=("Helvetica", 9, "italic"))
-        self._progress_label.pack(side="left", padx=12)
+
+        # Single paper progress panel
+        sp_panel = tk.Frame(f, bg=PALETTE["navy_mid"], bd=0)
+        sp_panel.pack(fill="x", padx=16, pady=(0, 4))
+
+        sp_top = tk.Frame(sp_panel, bg=PALETTE["navy_mid"])
+        sp_top.pack(fill="x", padx=10, pady=(6, 2))
+
+        self._progress_label = tk.Label(
+            sp_top, text="Ready.", bg=PALETTE["navy_mid"],
+            fg=PALETTE["grey_light"], font=("Helvetica", 9, "italic"), anchor="w")
+        self._progress_label.pack(side="left", fill="x", expand=True)
+
+        self._single_timer_label = tk.Label(
+            sp_top, text="", bg=PALETTE["navy_mid"],
+            fg=PALETTE["amber_light"], font=("Courier", 9, "bold"), anchor="e", width=10)
+        self._single_timer_label.pack(side="right")
+
+        self._single_pbar = ttk.Progressbar(sp_panel, mode="indeterminate", length=200)
+        self._single_pbar.pack(fill="x", padx=10, pady=(2, 6))
 
         res = tk.LabelFrame(f, text=" Analysis Results ", bg=PALETTE["bg"],
                             fg=PALETTE["navy"], font=("Helvetica", 10, "bold"),
@@ -565,13 +587,43 @@ class PaperScreenerApp(tk.Tk):
             padx=12, pady=6, cursor="hand2", state="disabled")
         self._batch_stop_btn.pack(side="right", padx=6)
 
-        pf = tk.Frame(f, bg=PALETTE["bg"])
-        pf.pack(fill="x", padx=16)
-        self._batch_progress = ttk.Progressbar(pf, mode="determinate")
-        self._batch_progress.pack(fill="x", pady=4)
-        self._batch_status = tk.Label(pf, text="", bg=PALETTE["bg"],
-                                      fg=PALETTE["teal"], font=("Helvetica", 9, "italic"))
-        self._batch_status.pack(anchor="w")
+        # ── Batch progress panel ──
+        bp = tk.Frame(f, bg=PALETTE["navy_mid"], bd=0)
+        bp.pack(fill="x", padx=16, pady=(4, 0))
+
+        # Row 1: progress bar + % label
+        bp_bar_row = tk.Frame(bp, bg=PALETTE["navy_mid"])
+        bp_bar_row.pack(fill="x", padx=10, pady=(6, 2))
+        self._batch_pct_label = tk.Label(
+            bp_bar_row, text="0%", bg=PALETTE["navy_mid"],
+            fg=PALETTE["amber_light"], font=("Courier", 9, "bold"), width=5, anchor="e")
+        self._batch_pct_label.pack(side="right")
+        self._batch_progress = ttk.Progressbar(bp_bar_row, mode="determinate")
+        self._batch_progress.pack(side="left", fill="x", expand=True)
+
+        # Row 2: current paper status + per-paper timer
+        bp_status_row = tk.Frame(bp, bg=PALETTE["navy_mid"])
+        bp_status_row.pack(fill="x", padx=10, pady=1)
+        self._batch_status = tk.Label(
+            bp_status_row, text="", bg=PALETTE["navy_mid"],
+            fg=PALETTE["grey_light"], font=("Helvetica", 9, "italic"), anchor="w")
+        self._batch_status.pack(side="left", fill="x", expand=True)
+        self._paper_timer_label = tk.Label(
+            bp_status_row, text="", bg=PALETTE["navy_mid"],
+            fg=PALETTE["teal_light"], font=("Courier", 9), anchor="e", width=14)
+        self._paper_timer_label.pack(side="right")
+
+        # Row 3: counts + total elapsed
+        bp_stats_row = tk.Frame(bp, bg=PALETTE["navy_mid"])
+        bp_stats_row.pack(fill="x", padx=10, pady=(1, 6))
+        self._batch_counts_label = tk.Label(
+            bp_stats_row, text="", bg=PALETTE["navy_mid"],
+            fg=PALETTE["grey_mid"], font=("Helvetica", 8), anchor="w")
+        self._batch_counts_label.pack(side="left", fill="x", expand=True)
+        self._batch_total_timer_label = tk.Label(
+            bp_stats_row, text="", bg=PALETTE["navy_mid"],
+            fg=PALETTE["amber_light"], font=("Courier", 9, "bold"), anchor="e", width=14)
+        self._batch_total_timer_label.pack(side="right")
 
         lf = tk.LabelFrame(f, text=" Batch Log ", bg=PALETTE["bg"],
                            fg=PALETTE["navy"], font=("Helvetica", 10, "bold"),
@@ -821,9 +873,12 @@ class PaperScreenerApp(tk.Tk):
             return
         self._set_busy(True)
         self._set_progress("Starting analysis…")
+        self._single_timer_label.config(text="")
+        self._start_single_timer()
         threading.Thread(target=self._analysis_worker, args=(paper_id,), daemon=True).start()
 
     def _analysis_worker(self, paper_id: str):
+        import time
         mode  = self._mode.get()
         model = self._ollama_model.get()
         key   = self._api_key.get().strip()
@@ -831,22 +886,28 @@ class PaperScreenerApp(tk.Tk):
             result = analyze_paper(
                 self._current_pdf_bytes, mode=mode, api_key=key, ollama_model=model,
                 progress_callback=lambda m: self.after(0, self._set_progress, m))
+            elapsed = time.monotonic() - (self._single_start_time or time.monotonic())
             entry = self._build_repo_entry(paper_id, result, mode, model)
             save_to_repository(entry)
             self.after(0, self._display_result, result, paper_id)
             self.after(0, self._refresh_repository_tab)
-            self.after(0, self._set_progress, "Analysis complete — saved to repository.")
+            self.after(0, self._set_progress,
+                       f"Analysis complete — saved to repository.  ({self._fmt_elapsed(elapsed)})")
+            self.after(0, self._stop_single_timer, elapsed)
         except ConnectionError as e:
             self.after(0, messagebox.showerror, "Ollama Not Running", str(e))
             self.after(0, self._set_progress, "Failed.")
+            self.after(0, self._stop_single_timer, None)
         except json.JSONDecodeError:
             self.after(0, messagebox.showerror, "Parse Error",
                        "The model returned an unexpected response format.\n"
                        "Try again, or switch to Anthropic API in Settings for more reliable output.")
             self.after(0, self._set_progress, "Failed.")
+            self.after(0, self._stop_single_timer, None)
         except Exception as e:
             self.after(0, messagebox.showerror, "Error", str(e))
             self.after(0, self._set_progress, "Failed.")
+            self.after(0, self._stop_single_timer, None)
         finally:
             self.after(0, self._set_busy, False)
 
@@ -947,6 +1008,15 @@ class PaperScreenerApp(tk.Tk):
         self._stop_requested = False
         self._set_busy(True)
         self._batch_log.delete("1.0","end")
+        # Reset progress panel
+        self._batch_progress["value"] = 0
+        self._batch_progress["maximum"] = 1
+        self._batch_pct_label.config(text="0%")
+        self._batch_counts_label.config(text="")
+        self._batch_status.config(text="")
+        self._paper_timer_label.config(text="")
+        self._batch_total_timer_label.config(text="")
+        self._start_batch_timers()
         threading.Thread(target=self._batch_worker, daemon=True).start()
 
     def _stop_batch(self):
@@ -955,13 +1025,12 @@ class PaperScreenerApp(tk.Tk):
         self._log_batch("\n⏹ Stop requested — finishing current paper then halting.\n", "info")
 
     def _batch_worker(self):
+        import time
         mode  = self._mode.get()
         model = self._ollama_model.get()
         key   = self._api_key.get().strip()
         rows = []
         try:
-            # Try encodings in order: UTF-8 with BOM (Excel default),
-            # Latin-1 (Windows Western European), plain UTF-8 with replacement
             for enc in ("utf-8-sig", "latin-1", "cp1252"):
                 try:
                     with open(self._batch_csv_path, newline="", encoding=enc) as f:
@@ -981,19 +1050,25 @@ class PaperScreenerApp(tk.Tk):
 
         total = len(rows)
         self._log_batch(f"Loaded {total} papers.\n","info")
-        self._batch_progress["maximum"] = total
+        self.after(0, self._batch_progress.__setitem__, "maximum", total)
+
+        # Running counters
+        n_included = n_excluded = n_manual = n_error = 0
 
         for i, row in enumerate(rows):
-            # Check stop flag between each paper
             if self._stop_requested:
                 self._log_batch(f"\n⏹ Batch stopped after {i} of {total} papers.\n", "info")
                 break
 
             pid  = row.get("paper_id", f"PAPER_{i+1}").strip()
             url  = row.get("url","").strip()
-            # Normalise path: strip surrounding whitespace and convert any
-            # Windows backslashes so the path works on the current OS
             fp   = row.get("file_path","").strip().replace("\\", os.sep).replace("/", os.sep)
+
+            # Update status label and reset per-paper timer
+            self.after(0, self._batch_status.config,
+                       {"text": f"Paper {i+1}/{total}: {pid}"})
+            self.after(0, self._new_paper_timer)
+
             self._log_batch(f"\n[{i+1}/{total}] {pid} — ","info")
 
             pdf_bytes = None
@@ -1006,11 +1081,18 @@ class PaperScreenerApp(tk.Tk):
                 if pdf_bytes: self._log_batch("fetched. ","ok")
                 else:
                     self._log_batch(f"FAILED ({err[:40]}). Skipping.\n","err")
-                    self.after(0, self._batch_progress.__setitem__, "value", i+1); continue
+                    n_error += 1
+                    self.after(0, self._update_batch_counts,
+                               i+1, total, n_included, n_excluded, n_manual, n_error)
+                    continue
             else:
                 self._log_batch("No source. Skipping.\n","err")
-                self.after(0, self._batch_progress.__setitem__, "value", i+1); continue
+                n_error += 1
+                self.after(0, self._update_batch_counts,
+                           i+1, total, n_included, n_excluded, n_manual, n_error)
+                continue
 
+            paper_t0 = time.monotonic()
             try:
                 self._log_batch("Analyzing… ","info")
                 result = analyze_paper(
@@ -1018,9 +1100,15 @@ class PaperScreenerApp(tk.Tk):
                     progress_callback=lambda m: self._log_batch(f"  [{m}]\n", "info"),
                     stop_flag=lambda: self._stop_requested,
                 )
+                paper_elapsed = time.monotonic() - paper_t0
                 rec  = result.get("overall_recommendation","?")
                 rtag = {"INCLUDE":"ok","EXCLUDE":"err","MANUAL_REVIEW":"info"}.get(rec,"info")
-                c    = result.get("criteria",{})
+
+                if rec == "INCLUDE":     n_included += 1
+                elif rec == "EXCLUDE":   n_excluded += 1
+                elif rec == "MANUAL_REVIEW": n_manual += 1
+
+                c = result.get("criteria",{})
                 entry = {
                     "paper_id": pid, "title": row.get("title",""),
                     "authors": row.get("authors",""), "year": row.get("year",""),
@@ -1040,21 +1128,31 @@ class PaperScreenerApp(tk.Tk):
                     "_full_result": result,
                 }
                 save_to_repository(entry)
-                self._log_batch(f"-> {rec}\n", rtag)
+                self._log_batch(
+                    f"→ {rec}  ({self._fmt_elapsed(paper_elapsed)})\n", rtag)
+
             except InterruptedError:
                 self._log_batch("stopped.\n", "info")
                 break
             except ConnectionError as e:
                 self._log_batch(f"OLLAMA ERROR: {str(e)[:80]}\n","err")
+                n_error += 1
             except ValueError as e:
                 self._log_batch(f"ERROR: {e}\n","err")
+                n_error += 1
             except Exception as e:
                 self._log_batch(f"ERROR: {e}\n","err")
+                n_error += 1
 
-            self.after(0, self._batch_progress.__setitem__, "value", i+1)
+            self.after(0, self._update_batch_counts,
+                       i+1, total, n_included, n_excluded, n_manual, n_error)
 
         self._log_batch(f"\nBatch complete. Repository updated.\n","ok")
+        self.after(0, self._batch_status.config,
+                   {"text": f"Done — {n_included} included, {n_excluded} excluded, "
+                            f"{n_manual} manual review, {n_error} errors"})
         self.after(0, self._refresh_repository_tab)
+        self.after(0, self._stop_batch_timers)
         self.after(0, self._set_busy, False)
 
     def _log_batch(self, msg, tag=""):
@@ -1110,6 +1208,89 @@ class PaperScreenerApp(tk.Tk):
         txt.configure(state="disabled")
 
     # ── Helpers ───────────────────────────────────────────────────────────────
+
+    # ── Timer helpers ─────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _fmt_elapsed(seconds: float) -> str:
+        """Format elapsed seconds as m:ss or h:mm:ss."""
+        s = int(seconds)
+        if s < 3600:
+            return f"{s // 60}:{s % 60:02d}"
+        return f"{s // 3600}:{(s % 3600) // 60:02d}:{s % 60:02d}"
+
+    def _start_single_timer(self):
+        import time
+        self._single_start_time = time.monotonic()
+        self._single_pbar.start(12)
+        self._tick_single()
+
+    def _tick_single(self):
+        import time
+        if not self._busy or self._single_start_time is None:
+            return
+        elapsed = time.monotonic() - self._single_start_time
+        self._single_timer_label.config(text=f"⏱ {self._fmt_elapsed(elapsed)}")
+        self._timer_after_id = self.after(1000, self._tick_single)
+
+    def _stop_single_timer(self, final_elapsed=None):
+        import time
+        if self._timer_after_id:
+            self.after_cancel(self._timer_after_id)
+            self._timer_after_id = None
+        self._single_pbar.stop()
+        if final_elapsed is not None:
+            self._single_timer_label.config(
+                text=f"✓ {self._fmt_elapsed(final_elapsed)}")
+        else:
+            self._single_timer_label.config(text="")
+
+    def _start_batch_timers(self):
+        import time
+        self._batch_start_time = time.monotonic()
+        self._paper_start_time = time.monotonic()
+        self._tick_batch()
+
+    def _new_paper_timer(self):
+        import time
+        self._paper_start_time = time.monotonic()
+
+    def _tick_batch(self):
+        import time
+        if not self._busy:
+            return
+        now = time.monotonic()
+        if self._paper_start_time:
+            paper_e = now - self._paper_start_time
+            self._paper_timer_label.config(
+                text=f"Paper: {self._fmt_elapsed(paper_e)}")
+        if self._batch_start_time:
+            total_e = now - self._batch_start_time
+            self._batch_total_timer_label.config(
+                text=f"Total: {self._fmt_elapsed(total_e)}")
+        self._timer_after_id = self.after(1000, self._tick_batch)
+
+    def _stop_batch_timers(self):
+        import time
+        if self._timer_after_id:
+            self.after_cancel(self._timer_after_id)
+            self._timer_after_id = None
+        if self._batch_start_time:
+            total_e = time.monotonic() - self._batch_start_time
+            self._batch_total_timer_label.config(
+                text=f"Done: {self._fmt_elapsed(total_e)}")
+        self._paper_timer_label.config(text="")
+
+    def _update_batch_counts(self, done, total, included, excluded, manual, errors):
+        pct = int(done / total * 100) if total else 0
+        self._batch_progress["value"] = done
+        self._batch_pct_label.config(text=f"{pct}%")
+        self._batch_counts_label.config(
+            text=f"{done}/{total} papers  ·  "
+                 f"Include: {included}  Exclude: {excluded}  "
+                 f"Manual Review: {manual}  Errors: {errors}")
+
+    # ── Validation ────────────────────────────────────────────────────────────
 
     def _validate_ready(self, need_pdf=True):
         if self._mode.get() == MODE_API and not self._api_key.get().strip():
