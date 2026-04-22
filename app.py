@@ -249,16 +249,19 @@ def fetch_pdf_from_url(url: str):
 
 def _clean_json(raw: str) -> dict:
     raw = raw.strip()
+    # Strip markdown fences if present
     raw = re.sub(r"^```json\s*", "", raw, flags=re.MULTILINE)
     raw = re.sub(r"^```\s*",     "", raw, flags=re.MULTILINE)
     raw = re.sub(r"\s*```$",     "", raw, flags=re.MULTILINE)
     raw = raw.strip()
-    start, end = raw.find("{"), raw.rfind("}")
-    if start != -1 and end != -1:
-        raw = raw[start:end+1]
-    if not raw:
-        raise json.JSONDecodeError("Empty response", "", 0)
-    return json.loads(raw)
+    # Find the start of the JSON object
+    start = raw.find("{")
+    if start == -1:
+        raise json.JSONDecodeError("No JSON object found in response", raw, 0)
+    # Use raw_decode so it stops at the end of the first complete object,
+    # ignoring any trailing text Claude may have appended after the closing }
+    obj, _ = json.JSONDecoder().raw_decode(raw, start)
+    return obj
 
 
 def analyze_paper(pdf_bytes: bytes, api_key: str, progress_callback=None) -> dict:
