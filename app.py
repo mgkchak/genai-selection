@@ -50,7 +50,7 @@ PALETTE = {
 }
 
 CSV_COLUMNS = [
-    "paper_id", "title", "authors", "year", "url", "file_path",
+    "paper_id", "title", "authors", "year", "publication_year", "url", "file_path",
     "recommendation", "confidence", "genai_used", "relevant_domain",
     "quality_assurance", "domains_identified", "metrics_identified",
     "key_decision_factors", "additional_notes", "analyzed_at", "model_used",
@@ -62,71 +62,121 @@ SYSTEM_PROMPT = """You are a systematic literature review screener for the GenAI
 a research initiative examining generative AI in educational assessment contexts. Your job is
 to evaluate whether a research paper meets the inclusion criteria for this meta-analysis.
 
-You must evaluate each paper against ALL THREE criteria and provide a structured JSON response.
+## CRITICAL LANGUAGE RULE
+All reasoning, text_examples, key_decision_factors, and additional_notes fields must contain
+ONLY verifiable facts stated in the paper: model names, task descriptions, reported metrics,
+dataset names, sample sizes, and direct quotes. Do NOT include evaluative language such as
+"well-documented," "high-quality," "strong example," "impressive," "thorough," or any other
+qualitative judgment about the paper's merit. Describe what the paper does, not how good it is.
 
-## Inclusion Criteria
+## Criterion 1: GenAI Used — verdict: YES / NO / UNCLEAR
+The primary AI system in the research must be a generative AI model.
+- INCLUDE: Research uses an LLM or generative model (GPT-3/4/4o, Claude, Gemini, LLaMA,
+  Mistral, DeepSeek, T5, BERT variants used generatively, etc.)
+- INCLUDE: Ensemble models that combine a GenAI component with traditional ML
+- EXCLUDE: Research uses only traditional/discriminative ML (SVM, Random Forest, KNN,
+  logistic regression, XGBoost, CNN/RNN without a generative LLM component)
+- EXCLUDE: Research where GenAI is only mentioned in the literature review but not used
+- Must have been conducted after 2020
 
-### Criterion 1: GenAI Used
-Paper describes research using Generative AI.
-- Research must have been conducted after 2020 (release of OpenAI GPT)
-- Paper references a Generative AI application (e.g., OpenAI GPT, Claude, DeepSeek, Gemini, LLaMA, etc.)
-- May include ensemble models that combine multiple approaches
-- EXCLUDE: papers that use only traditional ML approaches (KNN, Random Forest, etc.) without a GenAI/LLM component
+## Criterion 2: Relevant Assessment Domain — verdict: YES / NO / UNCLEAR
+The research must directly perform one of the four assessment tasks below using GenAI.
+"Discusses" or "mentions" a domain is NOT sufficient — the GenAI system must execute the task.
 
-### Criterion 2: Relevant Assessment Domain
-Research must focus on one or more of these educational assessment domains:
-- Item Generation: Creation of assessment items (forced choice, problem-based, simulations, etc.)
-- Formative Feedback: Real-time feedback to students to improve knowledge/skills/abilities
-- Automated Item Scoring: AI scoring of complex student work (essays, short answer, simulations) typically scored by humans
-- Multimodal (Audio/Video) Inferences: Assessment using audio/video data in classroom contexts
-- Educational/tutoring context required. Socioemotional skill teaching is OK.
-- EXCLUDE: papers that only address fairness approaches without any evaluation
+ITEM GENERATION (YES if):
+  - GenAI directly generates assessment questions, test items, prompts, or rubrics
+  - Covers any item type: MCQ, short answer, essay prompts, simulation tasks
+  (NO if): GenAI generates other content (stories, summaries) not used as assessment items
 
-### Criterion 3: Quality Assurance
-Paper describes model creation and evaluation methods in sufficient detail.
-Acceptable metrics include (but not limited to):
-- Precision, recall, F1 values with comparison groups
-- Accuracy compared to established benchmarks
-- Inter-rater reliability (human vs. AI)
-- Kappa, AUROC
-- GLEU, BLEU, ROUGE
-- EXCLUDE: papers without thorough descriptions of evaluation methods
+FORMATIVE FEEDBACK (YES if):
+  - GenAI generates feedback text delivered to students to improve their learning
+  - Feedback is tied to student work or responses, not just general content
+  (NO if): Paper evaluates whether humans can detect AI text; paper annotates data for
+  future feedback systems; paper generates scoring labels without student-facing feedback
+
+AUTOMATED ITEM SCORING (YES if):
+  - GenAI assigns scores, grades, or ratings to student-produced work (essays, short
+  answers, code, drawings, simulations) that is typically scored by humans
+  - Includes holistic scoring, trait scoring, rubric-based scoring
+  (NO if): GenAI classifies, annotates, or labels text for NLP/ML pipeline purposes
+  without the output being a score on student work; GenAI detects whether text is
+  AI-generated; GenAI scores non-student content
+
+MULTIMODAL INFERENCES (YES if):
+  - GenAI processes audio or video from classroom contexts to make assessment inferences
+  - Includes speech recognition, behavioral coding, engagement detection from A/V data
+  (NO if): Paper uses only text; multimodal data is not from a classroom/learning context
+
+CROSS-CUTTING EXCLUSIONS for Criterion 2:
+  - EXCLUDE if research task is AI detection / plagiarism detection
+  - EXCLUDE if research task is data annotation / labeling for training future models
+  - EXCLUDE if educational context is only background framing, not the actual study context
+  - EXCLUDE if the paper addresses fairness analysis only, with no assessment task
+
+## Criterion 3: Quality Assurance — verdict: YES / NO / UNCLEAR
+The paper must report quantitative evaluation metrics for the GenAI system's outputs.
+Acceptable metrics include but are not limited to:
+  - Precision, Recall, F1-score (with baseline or comparison group)
+  - Accuracy vs. established benchmark or human raters
+  - Cohen's Kappa, Weighted Kappa, Quadratic Weighted Kappa (QWK)
+  - AUROC, BLEU, ROUGE, GLEU, BERTScore
+  - Pearson/Spearman correlation with human scores
+  - Agreement rates (exact, adjacent) compared to human rater agreement
+EXCLUDE if: paper only reports descriptive outputs with no quantitative evaluation;
+paper describes a system without empirical results; evaluation metrics are only for
+a non-GenAI baseline with no GenAI-specific scores reported
+
+## Confidence Calibration
+Assign confidence based on how much interpretation was required:
+- High: All three criteria are unambiguously met or unambiguously not met based on
+  explicit statements in the paper. No domain boundary judgment was required.
+- Medium: At least one criterion required meaningful interpretation — e.g., the domain
+  is adjacent to but not clearly within scope; the GenAI role is secondary or unclear;
+  metrics are reported but for a proxy task rather than the main assessment outcome.
+- Low: The paper sits on a genuine domain boundary; key information is missing or
+  contradictory; the assessment task could be interpreted either way by a reasonable reviewer.
 
 ## Decision Rules
-- INCLUDE: All three criteria met (YES/YES/YES)
-- EXCLUDE: Any criterion not met, paper not in English, paper older than 2022
-- MANUAL_REVIEW: Borderline cases, unclear evidence, partial satisfaction, conflicting information
+- INCLUDE: All three criteria YES
+- EXCLUDE: Any criterion NO; paper not in English; paper published before 2022
+- MANUAL_REVIEW: Any criterion UNCLEAR, or genuinely borderline domain classification
+
+## Publication Year Extraction
+Extract the publication year from the paper itself (from the header, footer, copyright
+notice, submission date, or journal/conference metadata). Report only the 4-digit year.
+If not found, report null.
 
 ## Required Output Format
 Respond ONLY with valid JSON in this exact structure (no markdown fences, no preamble):
 {
   "overall_recommendation": "INCLUDE",
+  "publication_year": "2024",
   "criteria": {
     "genai_used": {
       "verdict": "YES",
-      "reasoning": "Detailed explanation",
-      "text_examples": "Direct quotes or paraphrases from the paper",
-      "location": "Page/section references where possible"
+      "reasoning": "Factual description of which GenAI model was used and for what task",
+      "text_examples": "Direct quote or close paraphrase from the paper",
+      "location": "Page/section reference"
     },
     "relevant_domain": {
       "verdict": "YES",
       "domains_identified": ["Automated Item Scoring"],
-      "reasoning": "Detailed explanation",
-      "text_examples": "Direct quotes or paraphrases from the paper",
-      "location": "Page/section references where possible"
+      "reasoning": "Factual description of what assessment task the GenAI system performs",
+      "text_examples": "Direct quote or close paraphrase from the paper",
+      "location": "Page/section reference"
     },
     "quality_assurance": {
       "verdict": "YES",
-      "metrics_identified": ["F1", "Kappa"],
-      "reasoning": "Detailed explanation",
-      "text_examples": "Direct quotes or paraphrases from the paper",
-      "location": "Page/section references where possible"
+      "metrics_identified": ["Quadratic Weighted Kappa", "F1"],
+      "reasoning": "List of specific metrics reported and what they measure in this paper",
+      "text_examples": "Direct quote or close paraphrase from the paper",
+      "location": "Page/section reference"
     }
   },
   "confidence_level": "High",
-  "confidence_rationale": "Explanation of confidence level",
-  "key_decision_factors": "Most important elements that led to the decision",
-  "additional_notes": "Any relevant observations, edge cases, or recommendations for human reviewers"
+  "confidence_rationale": "Specific statement of which criterion required interpretation, or confirmation that all criteria were unambiguous",
+  "key_decision_factors": "Factual list of the specific evidence that determined the recommendation",
+  "additional_notes": "Factual observations relevant for human reviewers: domain boundary issues, missing information, or conflicting signals in the paper"
 }"""
 
 
@@ -711,11 +761,15 @@ class PaperScreenerApp(tk.Tk):
         gn = c.get("genai_used", {})
         dm = c.get("relevant_domain", {})
         qa = c.get("quality_assurance", {})
+        # Year: prefer what Claude extracted from the paper; fall back to user-entered value
+        user_year = self._meta_vars["Year"].get().strip()
+        pub_year  = str(result.get("publication_year") or "").strip()
         return {
             "paper_id":             paper_id,
             "title":                self._meta_vars["Title"].get().strip(),
             "authors":              self._meta_vars["Authors"].get().strip(),
-            "year":                 self._meta_vars["Year"].get().strip(),
+            "year":                 user_year or pub_year,
+            "publication_year":     pub_year,
             "url":                  self._url_var.get().strip(),
             "file_path":            "",
             "recommendation":       result.get("overall_recommendation", ""),
@@ -746,6 +800,8 @@ class PaperScreenerApp(tk.Tk):
         w(f"  PAPER: {paper_id}", "heading")
         w(f"  RECOMMENDATION:  {rec}", rtag)
         w(f"  CONFIDENCE:      {conf}")
+        if result.get("publication_year"):
+            w(f"  YEAR (from paper): {result['publication_year']}")
         w("=" * 68)
 
         for key, label in [
@@ -906,11 +962,15 @@ class PaperScreenerApp(tk.Tk):
                 elif rec == "MANUAL_REVIEW": n_manual   += 1
 
                 c = result.get("criteria", {})
+                # Year: prefer Claude's extraction from the paper; fall back to CSV value
+                csv_year = row.get("year", "").strip()
+                pub_year = str(result.get("publication_year") or "").strip()
                 entry = {
                     "paper_id":    pid,
                     "title":       row.get("title", ""),
                     "authors":     row.get("authors", ""),
-                    "year":        row.get("year", ""),
+                    "year":        csv_year or pub_year,
+                    "publication_year": pub_year,
                     "url":         url,
                     "file_path":   fp,
                     "recommendation":       rec,
