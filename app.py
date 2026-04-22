@@ -34,8 +34,8 @@ except ImportError:
 MODE_OLLAMA     = "ollama"
 MODE_API        = "api"
 OLLAMA_BASE_URL = "http://localhost:11434"
-OLLAMA_MODELS   = ["llama3.2", "llama3.1", "mistral", "mixtral", "gemma2", "phi3"]
-DEFAULT_MODEL   = "llama3.2"
+OLLAMA_MODELS   = ["mistral", "llama3.1:8b", "llama3.1", "llama3.2", "mixtral", "gemma2", "phi3"]
+DEFAULT_MODEL   = "mistral"
 
 # ── App constants ─────────────────────────────────────────────────────────────
 
@@ -196,6 +196,7 @@ def _sync_csv(repo: list):
 # ── PDF helpers ───────────────────────────────────────────────────────────────
 
 def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
+    """Extract text from PDF, returning all pages with page markers."""
     parts = []
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for i, page in enumerate(pdf.pages):
@@ -203,6 +204,89 @@ def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
             if t:
                 parts.append(f"[Page {i+1}]\n{t}")
     return "\n\n".join(parts)
+
+
+# Patterns that signal the start of non-analytical content worth trimming
+_REF_SECTION_RE = re.compile(
+    r"\n(?:References|Bibliography|Works Cited|Acknowledgements?|Appendix|"
+    r"Supplementary|Funding|Conflict of Interest|Declaration|Author Contributions)"
+    r"\s*\n",
+    re.IGNORECASE,
+)
+
+# Regex to strip running headers/footers: lines ≤ 6 words that repeat or look like
+# page numbers, journal names, DOIs, URLs
+_NOISE_LINE_RE = re.compile(
+    r"^\s*(?:\d+\s*$|doi:[^\n]+|https?://[^\n]+|©[^\n]+|\[\d+\].*$)",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+# Section headings that are high-value for our screening task
+_KEY_SECTIONS = re.compile(
+    r"(abstract|introduction|background|method|approach|experiment|result|"
+    r"evaluation|discussion|conclusion|dataset|model|scoring|assessment|feedback)",
+    re.IGNORECASE,
+)
+
+
+def smart_extract_text(pdf_bytes: bytes, target_chars: int = 28000) -> tuple[str, str]:
+    """
+    Extract and intelligently trim PDF text for local model consumption.
+
+    Strategy:
+    1. Extract full text
+    2. Strip everything after References / Bibliography / Acknowledgements
+    3. Remove noisy lines (page numbers, DOIs, URLs, copyright)
+    4. If still too long, keep the first 40% (intro/methods) + last 30% (results/conclusion)
+       of the body, which captures the most decision-relevant content
+
+    Returns (trimmed_text, summary_note) where summary_note explains what was trimmed.
+    """
+    full = extract_text_from_pdf_bytes(pdf_bytes)
+    if not full.strip():
+        return full, ""
+
+    original_len = len(full)
+
+    # Step 1 — strip reference section and everything after
+    ref_match = _REF_SECTION_RE.search(full)
+    if ref_match:
+        body = full[:ref_match.start()]
+        refs_stripped = True
+    else:
+        body = full
+        refs_stripped = False
+
+    # Step 2 — remove noisy lines
+    body = _NOISE_LINE_RE.sub("", body)
+    # Collapse runs of blank lines to single blank line
+    body = re.sub(r"\n{3,}", "\n\n", body).strip()
+
+    body_len = len(body)
+
+    if body_len <= target_chars:
+        note = ""
+        if refs_stripped:
+            note = (f"[References/appendices stripped. "
+                    f"Extracted {body_len:,} of {original_len:,} chars.]")
+        return body, note
+
+    # Step 3 — still too long: take front 55% + back 35% of body
+    front = int(target_chars * 0.55)
+    back  = int(target_chars * 0.35)
+    middle_cut = body_len - front - back
+
+    trimmed = (
+        body[:front]
+        + f"\n\n[... ~{middle_cut:,} chars of mid-paper content omitted ...]\n\n"
+        + body[-back:]
+    )
+    note = (
+        f"[Smart trim: kept intro/methods + results/conclusion. "
+        f"Used {len(trimmed):,} of {original_len:,} chars. "
+        f"Refs stripped: {refs_stripped}]"
+    )
+    return trimmed, note
 
 
 def fetch_pdf_from_url(url: str):
@@ -266,75 +350,94 @@ def check_ollama_status():
 def analyze_with_ollama(pdf_bytes: bytes, model: str,
                         progress_callback=None, stop_flag=None) -> dict:
     if progress_callback:
-        progress_callback("Extracting text from PDF...")
-    text = extract_text_from_pdf_bytes(pdf_bytes)
+        progress_callback("Extracting and trimming PDF text…")
+
+    text, trim_note = smart_extract_text(pdf_bytes, target_chars=28000)
+
     if not text.strip():
         raise ValueError(
             "No extractable text found in the PDF.\n"
             "The file may be a scanned image. Please try a text-based PDF."
         )
 
-    # Progressive truncation: try 60k chars first, then 40k, then 25k.
-    # Empty responses from Ollama almost always mean the context window was exceeded.
-    TRUNCATE_STEPS = [60000, 40000, 25000]
-    last_err = None
+    if trim_note and progress_callback:
+        progress_callback(f"Text prepared. {trim_note}")
 
-    for truncate in TRUNCATE_STEPS:
-        if stop_flag and stop_flag():
-            raise InterruptedError("Stopped by user.")
+    if stop_flag and stop_flag():
+        raise InterruptedError("Stopped by user.")
 
-        chars_note = f"{truncate//1000}k chars"
-        if progress_callback:
-            label = "full text" if truncate == TRUNCATE_STEPS[0] else f"retrying at {chars_note}"
-            progress_callback(f"Sending to {model} ({label})… may take 1–5 min on CPU.")
+    if progress_callback:
+        progress_callback(f"Sending to {model} (~{len(text)//1000}k chars)… "
+                          f"may take 1–5 min on CPU.")
 
-        payload = {
-            "model": model, "stream": False,
-            "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user",   "content": _user_prompt_from_text(text, truncate=truncate)},
-            ],
-            "options": {"temperature": 0.1, "num_predict": 8192},
-        }
-        try:
-            resp = requests.post(
-                f"{OLLAMA_BASE_URL}/api/chat", json=payload, timeout=900
-            )
-            resp.raise_for_status()
-        except requests.exceptions.ConnectionError:
-            raise ConnectionError(
-                "Cannot connect to Ollama.\n\n"
-                "To fix this:\n"
-                "  1. Download Ollama from https://ollama.com\n"
-                "  2. Install and open it — it runs in the system tray\n"
-                "  3. Open Command Prompt and run:  ollama pull llama3.2\n"
-                "     (one-time ~2 GB download)\n"
-                "  4. Then click Analyze again"
-            )
+    # Stronger JSON-only prompt for local models which tend to ignore formatting
+    user_msg = (
+        "You are evaluating a research paper for a systematic literature review.\n\n"
+        "OUTPUT RULES — CRITICAL:\n"
+        "- Your entire response must be ONE valid JSON object\n"
+        "- Start with { on the very first character\n"
+        "- End with } on the very last character\n"
+        "- Zero prose before or after the JSON\n"
+        "- Zero markdown (no ```)\n\n"
+        "PAPER TEXT:\n"
+        "----------\n"
+        f"{text}\n"
+        "----------\n\n"
+        "Now output the JSON evaluation object:"
+    )
 
-        raw = resp.json().get("message", {}).get("content", "").strip()
+    payload = {
+        "model": model,
+        "stream": False,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user",   "content": user_msg},
+        ],
+        "options": {
+            "temperature": 0.0,   # deterministic — reduces hallucination
+            "num_predict": 4096,
+            "num_ctx": 16384,     # request larger context window if model supports it
+        },
+    }
 
-        if not raw:
-            last_err = ValueError(
-                f"Model returned empty response at {chars_note}. "
-                "Retrying with shorter text..."
-            )
-            if progress_callback:
-                progress_callback(f"Empty response at {chars_note} — trying shorter excerpt…")
-            continue
+    try:
+        resp = requests.post(
+            f"{OLLAMA_BASE_URL}/api/chat", json=payload, timeout=900
+        )
+        resp.raise_for_status()
+    except requests.exceptions.ConnectionError:
+        raise ConnectionError(
+            "Cannot connect to Ollama.\n\n"
+            "To fix this:\n"
+            "  1. Download Ollama from https://ollama.com\n"
+            "  2. Install and open it — it runs in the system tray\n"
+            "  3. Open Command Prompt and run:  ollama pull mistral\n"
+            "     (one-time ~4 GB download)\n"
+            "  4. Then click Analyze again"
+        )
 
-        try:
-            return _clean_json(raw)
-        except json.JSONDecodeError as e:
-            preview = raw[:200].replace("\n", " ")
-            last_err = ValueError(
-                f"Could not parse JSON at {chars_note}.\n"
-                f"Parse error: {e.msg}\n"
-                f"Response preview: {preview}"
-            )
-            continue
+    raw = resp.json().get("message", {}).get("content", "").strip()
 
-    raise last_err or ValueError("All truncation attempts failed.")
+    if not raw:
+        raise ValueError(
+            f"Model '{model}' returned an empty response.\n\n"
+            "This usually means the model's context window was exceeded or it timed out.\n"
+            "Try switching to a larger model (mistral or llama3.1:8b) in Settings,\n"
+            "or use the Anthropic API for reliable results."
+        )
+
+    try:
+        return _clean_json(raw)
+    except json.JSONDecodeError as e:
+        preview = raw[:300].replace("\n", " ")
+        raise ValueError(
+            f"Model returned prose instead of JSON.\n\n"
+            f"This is a known limitation of smaller local models.\n"
+            f"Recommendation: switch to 'mistral' or 'llama3.1:8b' in Settings,\n"
+            f"or use the Anthropic API for reliable JSON output.\n\n"
+            f"Parse error: {e.msg}\n"
+            f"Response preview: {preview}"
+        )
 
 
 def analyze_with_api(pdf_bytes: bytes, api_key: str, progress_callback=None) -> dict:
@@ -753,8 +856,9 @@ class PaperScreenerApp(tk.Tk):
                      "First-time Ollama setup:\n"
                      "  1. Download from https://ollama.com and install it\n"
                      "  2. It will appear in your system tray and start automatically\n"
-                     "  3. Open Command Prompt and run:   ollama pull llama3.2\n"
-                     "     (one-time ~2 GB download — after this, analysis is free and offline)"
+                     "  3. Open Command Prompt and run:   ollama pull mistral\n"
+                     "     (recommended — ~4 GB, much more reliable JSON output than llama3.2)\n"
+                     "  4. For fastest results, use the Anthropic API (~$0.01–0.05/paper)"
                  )).pack(anchor="w", padx=28, pady=(2,10))
 
         tk.Frame(inner, bg=PALETTE["grey_light"], height=1).pack(fill="x", pady=8)
