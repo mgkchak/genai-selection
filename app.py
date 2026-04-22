@@ -139,7 +139,7 @@ Assign confidence based on how much interpretation was required:
 
 ## Decision Rules
 - INCLUDE: All three criteria YES
-- EXCLUDE: Any criterion NO; paper not in English; paper published before 2022
+- EXCLUDE: Any criterion NO; paper not in English; paper published before 2023
 - MANUAL_REVIEW: Any criterion UNCLEAR, or genuinely borderline domain classification
 
 ## Publication Metadata Extraction
