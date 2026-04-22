@@ -1,6 +1,6 @@
 GenAI Evidence Hub — Paper Screener
 A desktop tool for screening research papers for inclusion/exclusion in the
-GenAI Evidence Hub systematic literature review (University of Pennsylvania · LDI).
+GenAI Evidence Hub systematic literature review (Learning Data Insights, LLC).
 ---
 Setup
 1. Install Python dependencies
