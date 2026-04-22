@@ -50,13 +50,14 @@ PALETTE = {
 }
 
 CSV_COLUMNS = [
-    "paper_id", "title", "authors", "year", "publication_year", "url", "file_path",
+    "paper_id", "title", "authors", "publication_year", "journal_or_venue",
+    "doi", "abstract", "url", "file_path",
     "recommendation", "confidence", "genai_used", "relevant_domain",
     "quality_assurance", "domains_identified", "metrics_identified",
     "key_decision_factors", "additional_notes", "analyzed_at", "model_used",
 ]
 
-BATCH_CSV_COLUMNS = ["paper_id", "title", "authors", "year", "url", "file_path"]
+BATCH_CSV_COLUMNS = ["paper_id", "url", "file_path"]
 
 SYSTEM_PROMPT = """You are a systematic literature review screener for the GenAI Evidence Hub,
 a research initiative examining generative AI in educational assessment contexts. Your job is
@@ -141,16 +142,25 @@ Assign confidence based on how much interpretation was required:
 - EXCLUDE: Any criterion NO; paper not in English; paper published before 2022
 - MANUAL_REVIEW: Any criterion UNCLEAR, or genuinely borderline domain classification
 
-## Publication Year Extraction
-Extract the publication year from the paper itself (from the header, footer, copyright
-notice, submission date, or journal/conference metadata). Report only the 4-digit year.
-If not found, report null.
+## Publication Metadata Extraction
+Extract the following fields directly from the paper. Report null for any field not found.
+- title: Full paper title as printed
+- authors: All author names as listed, in order, separated by "; "
+- publication_year: 4-digit year from header, footer, copyright notice, or journal metadata
+- journal_or_venue: Journal name, conference name, or preprint server (e.g. "arXiv", "OSF Preprints")
+- doi: DOI string if present (e.g. "10.1016/j.compedu.2024.01.001"), without "https://doi.org/" prefix
+- abstract: The full abstract text, copied verbatim from the paper
 
 ## Required Output Format
 Respond ONLY with valid JSON in this exact structure (no markdown fences, no preamble):
 {
   "overall_recommendation": "INCLUDE",
+  "title": "Full paper title",
+  "authors": "Last, First; Last, First",
   "publication_year": "2024",
+  "journal_or_venue": "Computers and Education: Artificial Intelligence",
+  "doi": "10.1016/j.compedu.2024.01.001",
+  "abstract": "Full abstract text copied verbatim from the paper.",
   "criteria": {
     "genai_used": {
       "verdict": "YES",
@@ -194,9 +204,9 @@ def ensure_repo():
             w = csv.DictWriter(f, fieldnames=BATCH_CSV_COLUMNS)
             w.writeheader()
             w.writerow({
-                "paper_id": "PAPER_001", "title": "Example Paper Title",
-                "authors": "Smith, J.; Jones, A.", "year": "2024",
-                "url": "https://example.com/paper.pdf", "file_path": "",
+                "paper_id": "PAPER_001",
+                "url": "https://example.com/paper.pdf",
+                "file_path": "",
             })
 
 
@@ -217,6 +227,14 @@ def save_to_repository(entry: dict):
             break
     else:
         repo.append(entry)
+    # Always keep sorted by paper_id ascending (numeric if possible, else lexicographic)
+    def _sort_key(r):
+        pid = r.get("paper_id", "")
+        try:
+            return (0, int(pid))
+        except (ValueError, TypeError):
+            return (1, str(pid))
+    repo.sort(key=_sort_key)
     REPO_JSON.write_text(json.dumps(repo, indent=2, ensure_ascii=False), encoding="utf-8")
     _sync_csv(repo)
 
@@ -386,16 +404,18 @@ class PaperScreenerApp(tk.Tk):
         meta.pack(fill="x", **pad)
         grid = tk.Frame(meta, bg=PALETTE["bg"])
         grid.pack(fill="x", padx=12, pady=8)
-        self._meta_vars = {}
-        for i, lbl in enumerate(["Paper ID *", "Title", "Authors", "Year"]):
-            tk.Label(grid, text=lbl, bg=PALETTE["bg"], fg=PALETTE["grey_dark"],
-                     font=("Helvetica", 9)).grid(row=i, column=0, sticky="w", pady=3)
-            var = tk.StringVar()
-            self._meta_vars[lbl] = var
-            tk.Entry(grid, textvariable=var, width=60, font=("Helvetica", 10),
-                     bd=1, relief="solid").grid(row=i, column=1, sticky="ew",
-                                                padx=(8, 0), pady=3)
-        grid.columnconfigure(1, weight=1)
+
+        tk.Label(grid, text="Paper ID *", bg=PALETTE["bg"], fg=PALETTE["grey_dark"],
+                 font=("Helvetica", 9)).grid(row=0, column=0, sticky="w", pady=3)
+        self._paper_id_var = tk.StringVar()
+        tk.Entry(grid, textvariable=self._paper_id_var, width=30,
+                 font=("Helvetica", 10), bd=1, relief="solid").grid(
+            row=0, column=1, sticky="w", padx=(8, 0), pady=3)
+        tk.Label(grid, text="Metadata (title, authors, year, etc.) will be extracted from the PDF",
+                 bg=PALETTE["bg"], fg=PALETTE["grey_mid"],
+                 font=("Helvetica", 8, "italic")).grid(
+            row=0, column=2, sticky="w", padx=12)
+        grid.columnconfigure(1, weight=0)
 
         src = tk.LabelFrame(f, text=" Paper Source ", bg=PALETTE["bg"],
                             fg=PALETTE["navy"], font=("Helvetica", 10, "bold"),
@@ -485,9 +505,11 @@ class PaperScreenerApp(tk.Tk):
                  font=("Helvetica", 9), justify="left", wraplength=820,
                  text=(
                      "Upload a CSV with one paper per row. Required column: paper_id.\n"
-                     "Optional: title, authors, year, url, file_path. Columns can be in any order.\n"
+                     "Source column (at least one required): url or file_path.\n"
                      "  file_path — local path to PDF (takes priority over url)\n"
-                     "  url — direct PDF link, fetched automatically"
+                     "  url — direct PDF link, fetched automatically\n"
+                     "All other metadata (title, authors, year, journal, DOI, abstract) "
+                     "is extracted automatically from the PDF."
                  )).pack(padx=12, pady=8, anchor="w")
         tk.Button(info, text="Download CSV Template",
                   command=self._download_batch_template,
@@ -601,8 +623,9 @@ class PaperScreenerApp(tk.Tk):
                            selectcolor=PALETTE["amber"],
                            indicatoron=1).pack(side="left", padx=4)
 
-        cols   = ("paper_id", "title", "year", "recommendation", "confidence", "analyzed_at")
-        widths = (100, 310, 50, 130, 80, 140)
+        cols   = ("paper_id", "title", "authors", "publication_year",
+                  "journal_or_venue", "recommendation", "confidence", "analyzed_at")
+        widths = (80, 240, 160, 60, 140, 110, 70, 130)
 
         tf = tk.Frame(f, bg=PALETTE["bg"])
         tf.pack(fill="both", expand=True, padx=16, pady=(0, 4))
@@ -726,7 +749,7 @@ class PaperScreenerApp(tk.Tk):
     def _run_single_analysis(self):
         if not self._validate_ready(need_pdf=True):
             return
-        paper_id = self._meta_vars["Paper ID *"].get().strip()
+        paper_id = self._paper_id_var.get().strip()
         if not paper_id:
             messagebox.showwarning("Missing ID", "Please enter a Paper ID.")
             return
@@ -764,29 +787,28 @@ class PaperScreenerApp(tk.Tk):
         gn = c.get("genai_used", {})
         dm = c.get("relevant_domain", {})
         qa = c.get("quality_assurance", {})
-        # Year: prefer what Claude extracted from the paper; fall back to user-entered value
-        user_year = self._meta_vars["Year"].get().strip()
-        pub_year  = str(result.get("publication_year") or "").strip()
         return {
-            "paper_id":             paper_id,
-            "title":                self._meta_vars["Title"].get().strip(),
-            "authors":              self._meta_vars["Authors"].get().strip(),
-            "year":                 user_year or pub_year,
-            "publication_year":     pub_year,
-            "url":                  self._url_var.get().strip(),
-            "file_path":            "",
-            "recommendation":       result.get("overall_recommendation", ""),
-            "confidence":           result.get("confidence_level", ""),
-            "genai_used":           gn.get("verdict", ""),
-            "relevant_domain":      dm.get("verdict", ""),
-            "quality_assurance":    qa.get("verdict", ""),
-            "domains_identified":   "; ".join(dm.get("domains_identified", [])),
-            "metrics_identified":   "; ".join(qa.get("metrics_identified", [])),
+            "paper_id":           paper_id,
+            "title":              str(result.get("title") or "").strip(),
+            "authors":            str(result.get("authors") or "").strip(),
+            "publication_year":   str(result.get("publication_year") or "").strip(),
+            "journal_or_venue":   str(result.get("journal_or_venue") or "").strip(),
+            "doi":                str(result.get("doi") or "").strip(),
+            "abstract":           str(result.get("abstract") or "").strip(),
+            "url":                self._url_var.get().strip(),
+            "file_path":          "",
+            "recommendation":     result.get("overall_recommendation", ""),
+            "confidence":         result.get("confidence_level", ""),
+            "genai_used":         gn.get("verdict", ""),
+            "relevant_domain":    dm.get("verdict", ""),
+            "quality_assurance":  qa.get("verdict", ""),
+            "domains_identified": "; ".join(dm.get("domains_identified", [])),
+            "metrics_identified": "; ".join(qa.get("metrics_identified", [])),
             "key_decision_factors": result.get("key_decision_factors", ""),
-            "additional_notes":     result.get("additional_notes", ""),
-            "analyzed_at":          datetime.datetime.now().isoformat(timespec="seconds"),
-            "model_used":           CLAUDE_MODEL,
-            "_full_result":         result,
+            "additional_notes":   result.get("additional_notes", ""),
+            "analyzed_at":        datetime.datetime.now().isoformat(timespec="seconds"),
+            "model_used":         CLAUDE_MODEL,
+            "_full_result":       result,
         }
 
     def _display_result(self, result: dict, paper_id: str):
@@ -803,8 +825,16 @@ class PaperScreenerApp(tk.Tk):
         w(f"  PAPER: {paper_id}", "heading")
         w(f"  RECOMMENDATION:  {rec}", rtag)
         w(f"  CONFIDENCE:      {conf}")
+        if result.get("title"):
+            w(f"  TITLE:           {result['title']}")
+        if result.get("authors"):
+            w(f"  AUTHORS:         {result['authors']}")
         if result.get("publication_year"):
-            w(f"  YEAR (from paper): {result['publication_year']}")
+            w(f"  YEAR:            {result['publication_year']}")
+        if result.get("journal_or_venue"):
+            w(f"  VENUE:           {result['journal_or_venue']}")
+        if result.get("doi"):
+            w(f"  DOI:             {result['doi']}")
         w("=" * 68)
 
         for key, label in [
@@ -965,31 +995,30 @@ class PaperScreenerApp(tk.Tk):
                 elif rec == "MANUAL_REVIEW": n_manual   += 1
 
                 c = result.get("criteria", {})
-                # Year: prefer Claude's extraction from the paper; fall back to CSV value
-                csv_year = row.get("year", "").strip()
-                pub_year = str(result.get("publication_year") or "").strip()
                 entry = {
-                    "paper_id":    pid,
-                    "title":       row.get("title", ""),
-                    "authors":     row.get("authors", ""),
-                    "year":        csv_year or pub_year,
-                    "publication_year": pub_year,
-                    "url":         url,
-                    "file_path":   fp,
-                    "recommendation":       rec,
-                    "confidence":           result.get("confidence_level", ""),
-                    "genai_used":           c.get("genai_used", {}).get("verdict", ""),
-                    "relevant_domain":      c.get("relevant_domain", {}).get("verdict", ""),
-                    "quality_assurance":    c.get("quality_assurance", {}).get("verdict", ""),
-                    "domains_identified":   "; ".join(
+                    "paper_id":           pid,
+                    "title":              str(result.get("title") or "").strip(),
+                    "authors":            str(result.get("authors") or "").strip(),
+                    "publication_year":   str(result.get("publication_year") or "").strip(),
+                    "journal_or_venue":   str(result.get("journal_or_venue") or "").strip(),
+                    "doi":                str(result.get("doi") or "").strip(),
+                    "abstract":           str(result.get("abstract") or "").strip(),
+                    "url":                url,
+                    "file_path":          fp,
+                    "recommendation":     rec,
+                    "confidence":         result.get("confidence_level", ""),
+                    "genai_used":         c.get("genai_used", {}).get("verdict", ""),
+                    "relevant_domain":    c.get("relevant_domain", {}).get("verdict", ""),
+                    "quality_assurance":  c.get("quality_assurance", {}).get("verdict", ""),
+                    "domains_identified": "; ".join(
                         c.get("relevant_domain", {}).get("domains_identified", [])),
-                    "metrics_identified":   "; ".join(
+                    "metrics_identified": "; ".join(
                         c.get("quality_assurance", {}).get("metrics_identified", [])),
                     "key_decision_factors": result.get("key_decision_factors", ""),
-                    "additional_notes":     result.get("additional_notes", ""),
-                    "analyzed_at":          datetime.datetime.now().isoformat(timespec="seconds"),
-                    "model_used":           CLAUDE_MODEL,
-                    "_full_result":         result,
+                    "additional_notes":   result.get("additional_notes", ""),
+                    "analyzed_at":        datetime.datetime.now().isoformat(timespec="seconds"),
+                    "model_used":         CLAUDE_MODEL,
+                    "_full_result":       result,
                 }
                 save_to_repository(entry)
                 self._log_batch(f"→ {rec}  ({self._fmt_elapsed(paper_elapsed)})\n", rtag)
@@ -1025,6 +1054,16 @@ class PaperScreenerApp(tk.Tk):
         repo  = load_repository()
         query = self._filter_var.get().lower() if hasattr(self, "_filter_var") else ""
         rec_f = self._rec_filter.get() if hasattr(self, "_rec_filter") else "All"
+
+        # Sort by paper_id ascending (numeric if possible, else lexicographic)
+        def _sort_key(r):
+            pid = r.get("paper_id", "")
+            try:
+                return (0, int(pid))
+            except (ValueError, TypeError):
+                return (1, str(pid))
+        repo.sort(key=_sort_key)
+
         for item in self._tree.get_children():
             self._tree.delete(item)
         for r in repo:
@@ -1035,7 +1074,9 @@ class PaperScreenerApp(tk.Tk):
             ts  = r.get("analyzed_at", "")[:16].replace("T", " ")
             self._tree.insert("", "end", iid=r.get("paper_id"),
                               values=(r.get("paper_id",""), r.get("title",""),
-                                      r.get("year",""), rec, r.get("confidence",""), ts),
+                                      r.get("authors",""), r.get("publication_year",""),
+                                      r.get("journal_or_venue",""),
+                                      rec, r.get("confidence",""), ts),
                               tags=(tag,))
 
     def _sort_tree(self, col):
