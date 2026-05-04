@@ -16,7 +16,6 @@ import time
 import datetime
 import base64
 import requests
-import pdfplumber
 import anthropic
 from pathlib import Path
 import io
@@ -33,20 +32,38 @@ BATCH_TEMPLATE_CSV = REPO_DIR / "batch_template.csv"
 CLAUDE_MODEL = "claude-opus-4-5"
 
 PALETTE = {
-    "navy":        "#1B2A4A",
-    "navy_mid":    "#243560",
-    "teal":        "#2A7F8F",
-    "teal_light":  "#3BA3B5",
-    "amber":       "#E8A020",
-    "amber_light": "#F5C050",
-    "white":       "#F4F6FA",
-    "grey_light":  "#E2E8F0",
-    "grey_mid":    "#94A3B8",
-    "grey_dark":   "#475569",
-    "green":       "#22875A",
-    "red":         "#C0392B",
-    "orange":      "#D4750A",
-    "bg":          "#F0F4FA",
+    # Surfaces
+    "bg":           "#F6F5F3",
+    "surface":      "#FFFFFF",
+    "surface_dim":  "#EFEDE9",
+    "border":       "#E0DED9",
+    "border_dark":  "#C4C0B8",
+    # Type
+    "ink":          "#18181A",
+    "ink_mid":      "#52524E",
+    "ink_faint":    "#96948E",
+    # Brand / header
+    "brand":        "#18181A",
+    "brand_accent": "#C4984A",
+    # Actions
+    "action":       "#18181A",
+    "action_text":  "#FFFFFF",
+    "action_sec":   "#ECEAE5",
+    "action_sec_t": "#18181A",
+    # Signals
+    "include":      "#1A6B45",
+    "include_bg":   "#EAF5EE",
+    "exclude":      "#B03030",
+    "exclude_bg":   "#FAECEC",
+    "manual":       "#8C6200",
+    "manual_bg":    "#FDF4E3",
+    # Console
+    "console_bg":   "#111111",
+    "console_fg":   "#D0CEC8",
+    "console_ok":   "#4DC98A",
+    "console_err":  "#E06060",
+    "console_info": "#C4984A",
+    "console_key":  "#78BFDA",
 }
 
 CSV_COLUMNS = [
@@ -327,8 +344,8 @@ class PaperScreenerApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_TITLE)
-        self.geometry("1100x820")
-        self.minsize(900, 680)
+        self.geometry("1140x860")
+        self.minsize(960, 700)
         self.configure(bg=PALETTE["bg"])
 
         ensure_repo()
@@ -344,26 +361,71 @@ class PaperScreenerApp(tk.Tk):
         self._paper_start_time  = None
         self._timer_after_id    = None
 
+        self._apply_styles()
         self._build_ui()
         self._refresh_repository_tab()
+
+    # ── Styles ────────────────────────────────────────────────────────────────
+
+    def _apply_styles(self):
+        s = ttk.Style(self)
+        s.theme_use("default")
+
+        # Notebook
+        s.configure("TNotebook",
+                    background=PALETTE["bg"], borderwidth=0, tabmargins=[0, 0, 0, 0])
+        s.configure("TNotebook.Tab",
+                    background=PALETTE["bg"], foreground=PALETTE["ink_faint"],
+                    padding=[20, 10], font=("Helvetica", 9, "bold"),
+                    borderwidth=0, relief="flat")
+        s.map("TNotebook.Tab",
+              background=[("selected", PALETTE["surface"])],
+              foreground=[("selected", PALETTE["ink"])],
+              expand=[("selected", [0, 0, 0, 0])])
+
+        # Progress bars
+        s.configure("Thin.Horizontal.TProgressbar",
+                    troughcolor=PALETTE["border"], background=PALETTE["ink"],
+                    borderwidth=0, thickness=3)
+        s.configure("Indeterminate.Horizontal.TProgressbar",
+                    troughcolor=PALETTE["border"], background=PALETTE["brand_accent"],
+                    borderwidth=0, thickness=3)
+
+        # Treeview
+        s.configure("Repo.Treeview",
+                    rowheight=28, font=("Helvetica", 9),
+                    background=PALETTE["surface"],
+                    fieldbackground=PALETTE["surface"],
+                    foreground=PALETTE["ink"],
+                    borderwidth=0, relief="flat")
+        s.configure("Repo.Treeview.Heading",
+                    font=("Helvetica", 8, "bold"),
+                    background=PALETTE["surface_dim"],
+                    foreground=PALETTE["ink_mid"],
+                    borderwidth=0, relief="flat",
+                    padding=[8, 6])
+        s.map("Repo.Treeview",
+              background=[("selected", PALETTE["brand_accent"])],
+              foreground=[("selected", PALETTE["surface"])])
 
     # ── Layout ────────────────────────────────────────────────────────────────
 
     def _build_ui(self):
         self._build_header()
-        self.notebook = ttk.Notebook(self)
-        self.notebook.pack(fill="both", expand=True, padx=16, pady=(0, 16))
-        self._style_notebook()
+
+        # Tab strip sits directly below header
+        self.notebook = ttk.Notebook(self, style="TNotebook")
+        self.notebook.pack(fill="both", expand=True)
 
         self.tab_single = tk.Frame(self.notebook, bg=PALETTE["bg"])
         self.tab_batch  = tk.Frame(self.notebook, bg=PALETTE["bg"])
         self.tab_repo   = tk.Frame(self.notebook, bg=PALETTE["bg"])
         self.tab_config = tk.Frame(self.notebook, bg=PALETTE["bg"])
 
-        self.notebook.add(self.tab_single, text="  Single Paper  ")
-        self.notebook.add(self.tab_batch,  text="  Batch Upload  ")
-        self.notebook.add(self.tab_repo,   text="  Repository  ")
-        self.notebook.add(self.tab_config, text="  Settings  ")
+        self.notebook.add(self.tab_single, text="Single Paper")
+        self.notebook.add(self.tab_batch,  text="Batch Upload")
+        self.notebook.add(self.tab_repo,   text="Repository")
+        self.notebook.add(self.tab_config, text="Settings")
 
         self._build_single_tab()
         self._build_batch_tab()
@@ -371,337 +433,449 @@ class PaperScreenerApp(tk.Tk):
         self._build_config_tab()
 
     def _build_header(self):
-        hdr = tk.Frame(self, bg=PALETTE["navy"], height=64)
+        hdr = tk.Frame(self, bg=PALETTE["brand"], height=56)
         hdr.pack(fill="x")
         hdr.pack_propagate(False)
-        tk.Label(hdr, text="GenAI Evidence Hub",
-                 font=("Georgia", 18, "bold"),
-                 fg=PALETTE["amber"], bg=PALETTE["navy"]).pack(side="left", padx=20, pady=12)
-        tk.Label(hdr, text="Paper Screening Tool  |  Learning Data Insights, LLC",
-                 font=("Georgia", 10),
-                 fg=PALETTE["grey_light"], bg=PALETTE["navy"]).pack(side="left", pady=18)
 
-    def _style_notebook(self):
-        s = ttk.Style(self)
-        s.theme_use("default")
-        s.configure("TNotebook", background=PALETTE["bg"], borderwidth=0)
-        s.configure("TNotebook.Tab", background=PALETTE["grey_light"],
-                    foreground=PALETTE["navy"], padding=[12, 6],
-                    font=("Helvetica", 10, "bold"))
-        s.map("TNotebook.Tab",
-              background=[("selected", PALETTE["navy"])],
-              foreground=[("selected", PALETTE["amber"])])
+        left = tk.Frame(hdr, bg=PALETTE["brand"])
+        left.pack(side="left", padx=28, fill="y")
+
+        tk.Label(left, text="GenAI Evidence Hub",
+                 font=("Georgia", 15, "bold"),
+                 fg=PALETTE["brand_accent"],
+                 bg=PALETTE["brand"]).pack(side="left", anchor="center")
+
+        tk.Label(left, text="  ·  Paper Screener",
+                 font=("Helvetica", 11),
+                 fg="#6A6A60",
+                 bg=PALETTE["brand"]).pack(side="left", anchor="center")
+
+        tk.Label(hdr, text="Learning Data Insights, LLC",
+                 font=("Helvetica", 8),
+                 fg="#4A4A44",
+                 bg=PALETTE["brand"]).pack(side="right", padx=28, anchor="center")
+
+    # ── Helpers: card and button factories ────────────────────────────────────
+
+    def _card(self, parent, label=None, pad=(20, 12)):
+        """A flat white card with optional section label above it."""
+        outer = tk.Frame(parent, bg=PALETTE["bg"])
+        outer.pack(fill="x", padx=24, pady=(8, 0))
+        if label:
+            tk.Label(outer, text=label.upper(),
+                     bg=PALETTE["bg"], fg=PALETTE["ink_faint"],
+                     font=("Helvetica", 7, "bold"),
+                     anchor="w").pack(fill="x", pady=(0, 4))
+        card = tk.Frame(outer, bg=PALETTE["surface"],
+                        highlightbackground=PALETTE["border"],
+                        highlightthickness=1)
+        card.pack(fill="x")
+        inner = tk.Frame(card, bg=PALETTE["surface"])
+        inner.pack(fill="x", padx=pad[0], pady=pad[1])
+        return inner
+
+    def _btn(self, parent, text, command, style="primary",
+             padx=18, pady=7, width=None):
+        """Flat button with primary / secondary / danger styles."""
+        cfg = {
+            "primary":   (PALETTE["action"],     PALETTE["action_text"]),
+            "secondary": (PALETTE["action_sec"],  PALETTE["action_sec_t"]),
+            "danger":    (PALETTE["exclude"],      "#FFFFFF"),
+            "ghost":     (PALETTE["bg"],           PALETTE["ink_mid"]),
+        }
+        bg, fg = cfg.get(style, cfg["primary"])
+        kw = dict(text=text, command=command, bg=bg, fg=fg,
+                  font=("Helvetica", 9, "bold"), relief="flat",
+                  padx=padx, pady=pady, cursor="hand2",
+                  activebackground=bg, activeforeground=fg,
+                  bd=0)
+        if width:
+            kw["width"] = width
+        return tk.Button(parent, **kw)
+
+    def _divider(self, parent, vertical_pad=8):
+        tk.Frame(parent, bg=PALETTE["border"], height=1).pack(
+            fill="x", padx=24, pady=vertical_pad)
 
     # ── Single Paper Tab ──────────────────────────────────────────────────────
 
     def _build_single_tab(self):
-        f   = self.tab_single
-        pad = {"padx": 16, "pady": 8}
+        f = self.tab_single
 
-        meta = tk.LabelFrame(f, text=" Paper Information ", bg=PALETTE["bg"],
-                             fg=PALETTE["navy"], font=("Helvetica", 10, "bold"),
-                             bd=1, relief="groove")
-        meta.pack(fill="x", **pad)
-        grid = tk.Frame(meta, bg=PALETTE["bg"])
-        grid.pack(fill="x", padx=12, pady=8)
+        # ── Paper ID card ──
+        id_inner = self._card(f, label="Paper ID")
+        id_row = tk.Frame(id_inner, bg=PALETTE["surface"])
+        id_row.pack(fill="x")
 
-        tk.Label(grid, text="Paper ID *", bg=PALETTE["bg"], fg=PALETTE["grey_dark"],
-                 font=("Helvetica", 9)).grid(row=0, column=0, sticky="w", pady=3)
         self._paper_id_var = tk.StringVar()
-        tk.Entry(grid, textvariable=self._paper_id_var, width=30,
-                 font=("Helvetica", 10), bd=1, relief="solid").grid(
-            row=0, column=1, sticky="w", padx=(8, 0), pady=3)
-        tk.Label(grid, text="Metadata (title, authors, year, etc.) will be extracted from the PDF",
-                 bg=PALETTE["bg"], fg=PALETTE["grey_mid"],
-                 font=("Helvetica", 8, "italic")).grid(
-            row=0, column=2, sticky="w", padx=12)
-        grid.columnconfigure(1, weight=0)
+        id_entry = tk.Entry(id_row, textvariable=self._paper_id_var,
+                            font=("Helvetica", 11), bd=0, relief="flat",
+                            bg=PALETTE["surface"], fg=PALETTE["ink"],
+                            insertbackground=PALETTE["ink"],
+                            highlightthickness=1,
+                            highlightbackground=PALETTE["border"],
+                            highlightcolor=PALETTE["ink"], width=22)
+        id_entry.pack(side="left", ipady=6, padx=(0, 16))
 
-        src = tk.LabelFrame(f, text=" Paper Source ", bg=PALETTE["bg"],
-                            fg=PALETTE["navy"], font=("Helvetica", 10, "bold"),
-                            bd=1, relief="groove")
-        src.pack(fill="x", **pad)
-        inner = tk.Frame(src, bg=PALETTE["bg"])
-        inner.pack(fill="x", padx=12, pady=8)
+        tk.Label(id_row, text="All other metadata is extracted automatically from the PDF.",
+                 bg=PALETTE["surface"], fg=PALETTE["ink_faint"],
+                 font=("Helvetica", 8, "italic")).pack(side="left")
 
-        url_row = tk.Frame(inner, bg=PALETTE["bg"])
-        url_row.pack(fill="x", pady=3)
-        tk.Label(url_row, text="URL:", bg=PALETTE["bg"], fg=PALETTE["grey_dark"],
-                 width=10, anchor="w", font=("Helvetica", 9)).pack(side="left")
+        # ── Source card ──
+        src_inner = self._card(f, label="Paper Source")
+
+        url_row = tk.Frame(src_inner, bg=PALETTE["surface"])
+        url_row.pack(fill="x", pady=(0, 8))
+        tk.Label(url_row, text="URL", bg=PALETTE["surface"], fg=PALETTE["ink_mid"],
+                 font=("Helvetica", 8, "bold"), width=6, anchor="w").pack(side="left")
         self._url_var = tk.StringVar()
-        tk.Entry(url_row, textvariable=self._url_var, font=("Helvetica", 10),
-                 bd=1, relief="solid").pack(side="left", fill="x", expand=True, padx=(4, 8))
-        tk.Button(url_row, text="Fetch PDF", command=self._fetch_url,
-                  bg=PALETTE["teal"], fg="white",
-                  font=("Helvetica", 9, "bold"), relief="flat", padx=10).pack(side="left")
+        url_entry = tk.Entry(url_row, textvariable=self._url_var,
+                             font=("Helvetica", 9), bd=0, relief="flat",
+                             bg=PALETTE["surface_dim"], fg=PALETTE["ink"],
+                             insertbackground=PALETTE["ink"],
+                             highlightthickness=1,
+                             highlightbackground=PALETTE["border"],
+                             highlightcolor=PALETTE["ink"])
+        url_entry.pack(side="left", fill="x", expand=True, ipady=5, padx=(6, 10))
+        self._btn(src_inner if False else url_row,
+                  "Fetch", self._fetch_url, "secondary", padx=14, pady=5
+                  ).pack(side="left")
 
-        up_row = tk.Frame(inner, bg=PALETTE["bg"])
-        up_row.pack(fill="x", pady=3)
-        tk.Label(up_row, text="— or —", bg=PALETTE["bg"], fg=PALETTE["grey_mid"],
-                 font=("Helvetica", 9, "italic")).pack(side="left", padx=8)
-        tk.Button(up_row, text="Upload PDF", command=self._upload_pdf,
-                  bg=PALETTE["navy_mid"], fg="white",
-                  font=("Helvetica", 9, "bold"), relief="flat", padx=12).pack(side="left")
-        self._file_label = tk.Label(up_row, text="No file selected",
-                                    bg=PALETTE["bg"], fg=PALETTE["grey_mid"],
-                                    font=("Helvetica", 9, "italic"))
-        self._file_label.pack(side="left", padx=8)
+        sep_row = tk.Frame(src_inner, bg=PALETTE["surface"])
+        sep_row.pack(fill="x", pady=4)
+        tk.Frame(sep_row, bg=PALETTE["border"], height=1).pack(
+            side="left", fill="x", expand=True)
+        tk.Label(sep_row, text="  or  ", bg=PALETTE["surface"],
+                 fg=PALETTE["ink_faint"], font=("Helvetica", 8)).pack(side="left")
+        tk.Frame(sep_row, bg=PALETTE["border"], height=1).pack(
+            side="left", fill="x", expand=True)
 
-        btn_row = tk.Frame(f, bg=PALETTE["bg"])
-        btn_row.pack(fill="x", padx=16, pady=4)
-        self._analyze_btn = tk.Button(
-            btn_row, text="▶  Analyze Paper",
-            command=self._run_single_analysis,
-            bg=PALETTE["amber"], fg=PALETTE["navy"],
-            font=("Helvetica", 11, "bold"), relief="flat",
-            padx=20, pady=8, cursor="hand2")
+        file_row = tk.Frame(src_inner, bg=PALETTE["surface"])
+        file_row.pack(fill="x")
+        self._btn(file_row, "Upload PDF", self._upload_pdf,
+                  "secondary", padx=14, pady=5).pack(side="left")
+        self._file_label = tk.Label(file_row, text="No file selected",
+                                    bg=PALETTE["surface"], fg=PALETTE["ink_faint"],
+                                    font=("Helvetica", 8, "italic"))
+        self._file_label.pack(side="left", padx=12)
+
+        # ── Analyze button + progress ──
+        act_outer = tk.Frame(f, bg=PALETTE["bg"])
+        act_outer.pack(fill="x", padx=24, pady=12)
+
+        self._analyze_btn = self._btn(act_outer, "Analyze Paper",
+                                      self._run_single_analysis, "primary",
+                                      padx=24, pady=9)
         self._analyze_btn.pack(side="left")
 
-        # Progress panel
-        sp_panel = tk.Frame(f, bg=PALETTE["navy_mid"])
-        sp_panel.pack(fill="x", padx=16, pady=(0, 4))
-        sp_top = tk.Frame(sp_panel, bg=PALETTE["navy_mid"])
-        sp_top.pack(fill="x", padx=10, pady=(6, 2))
+        prog_right = tk.Frame(act_outer, bg=PALETTE["bg"])
+        prog_right.pack(side="left", fill="x", expand=True, padx=20)
+
+        prog_top = tk.Frame(prog_right, bg=PALETTE["bg"])
+        prog_top.pack(fill="x")
         self._progress_label = tk.Label(
-            sp_top, text="Ready.", bg=PALETTE["navy_mid"],
-            fg=PALETTE["grey_light"], font=("Helvetica", 9, "italic"), anchor="w")
+            prog_top, text="Ready.", bg=PALETTE["bg"],
+            fg=PALETTE["ink_faint"], font=("Helvetica", 8, "italic"), anchor="w")
         self._progress_label.pack(side="left", fill="x", expand=True)
         self._single_timer_label = tk.Label(
-            sp_top, text="", bg=PALETTE["navy_mid"],
-            fg=PALETTE["amber_light"], font=("Courier", 9, "bold"), anchor="e", width=10)
+            prog_top, text="", bg=PALETTE["bg"],
+            fg=PALETTE["brand_accent"], font=("Courier", 9, "bold"), anchor="e", width=8)
         self._single_timer_label.pack(side="right")
-        self._single_pbar = ttk.Progressbar(sp_panel, mode="indeterminate")
-        self._single_pbar.pack(fill="x", padx=10, pady=(2, 6))
 
-        res = tk.LabelFrame(f, text=" Analysis Results ", bg=PALETTE["bg"],
-                            fg=PALETTE["navy"], font=("Helvetica", 10, "bold"),
-                            bd=1, relief="groove")
-        res.pack(fill="both", expand=True, **pad)
+        self._single_pbar = ttk.Progressbar(
+            prog_right, mode="indeterminate",
+            style="Indeterminate.Horizontal.TProgressbar")
+        self._single_pbar.pack(fill="x", pady=(4, 0))
+
+        self._divider(f, vertical_pad=0)
+
+        # ── Results ──
+        res_outer = tk.Frame(f, bg=PALETTE["bg"])
+        res_outer.pack(fill="both", expand=True, padx=24, pady=(10, 16))
+
+        tk.Label(res_outer, text="ANALYSIS RESULTS",
+                 bg=PALETTE["bg"], fg=PALETTE["ink_faint"],
+                 font=("Helvetica", 7, "bold"), anchor="w").pack(fill="x", pady=(0, 4))
+
+        res_card = tk.Frame(res_outer, bg=PALETTE["console_bg"],
+                            highlightbackground=PALETTE["border"],
+                            highlightthickness=1)
+        res_card.pack(fill="both", expand=True)
+
         self._result_text = scrolledtext.ScrolledText(
-            res, font=("Courier", 9), bg="#1e2636", fg="#c8d8f0",
-            insertbackground="white", bd=0, padx=10, pady=8, wrap="word")
-        self._result_text.pack(fill="both", expand=True, padx=8, pady=8)
+            res_card, font=("Courier New", 9),
+            bg=PALETTE["console_bg"], fg=PALETTE["console_fg"],
+            insertbackground=PALETTE["console_fg"],
+            bd=0, padx=16, pady=12, wrap="word",
+            selectbackground=PALETTE["ink_mid"])
+        self._result_text.pack(fill="both", expand=True)
         self._result_text.insert("1.0", "Results will appear here after analysis.")
         self._result_text.configure(state="disabled")
-        for tag, color in [("include","#5BE8A0"), ("exclude","#FF7B7B"),
-                           ("manual","#FFD166"),  ("yes","#5BE8A0"),
-                           ("no","#FF7B7B"),       ("unclear","#FFD166"),
-                           ("key","#94D8F0")]:
+
+        for tag, color in [
+            ("include",  PALETTE["console_ok"]),
+            ("exclude",  PALETTE["console_err"]),
+            ("manual",   PALETTE["console_info"]),
+            ("yes",      PALETTE["console_ok"]),
+            ("no",       PALETTE["console_err"]),
+            ("unclear",  PALETTE["console_info"]),
+            ("key",      PALETTE["console_key"]),
+        ]:
             self._result_text.tag_config(tag, foreground=color)
-        self._result_text.tag_config("heading", foreground=PALETTE["amber_light"],
-                                     font=("Courier", 10, "bold"))
+        self._result_text.tag_config(
+            "heading", foreground=PALETTE["brand_accent"],
+            font=("Courier New", 9, "bold"))
 
     # ── Batch Tab ─────────────────────────────────────────────────────────────
 
     def _build_batch_tab(self):
-        f   = self.tab_batch
-        pad = {"padx": 16, "pady": 10}
+        f = self.tab_batch
 
-        info = tk.LabelFrame(f, text=" Batch Upload Instructions ", bg=PALETTE["bg"],
-                             fg=PALETTE["navy"], font=("Helvetica", 10, "bold"),
-                             bd=1, relief="groove")
-        info.pack(fill="x", **pad)
-        tk.Label(info, bg=PALETTE["bg"], fg=PALETTE["grey_dark"],
-                 font=("Helvetica", 9), justify="left", wraplength=820,
+        # ── Instructions card ──
+        info_inner = self._card(f, label="Instructions")
+        tk.Label(info_inner, bg=PALETTE["surface"], fg=PALETTE["ink_mid"],
+                 font=("Helvetica", 9), justify="left", anchor="w",
                  text=(
-                     "Upload a CSV with one paper per row. Required column: paper_id.\n"
-                     "Source column (at least one required): url or file_path.\n"
-                     "  file_path — local path to PDF (takes priority over url)\n"
-                     "  url — direct PDF link, fetched automatically\n"
-                     "All other metadata (title, authors, year, journal, DOI, abstract) "
-                     "is extracted automatically from the PDF."
-                 )).pack(padx=12, pady=8, anchor="w")
-        tk.Button(info, text="Download CSV Template",
-                  command=self._download_batch_template,
-                  bg=PALETTE["teal"], fg="white",
-                  font=("Helvetica", 9, "bold"), relief="flat", padx=10
-                  ).pack(padx=12, pady=(0, 8), anchor="w")
+                     "Upload a CSV with one paper per row.\n"
+                     "Required column: paper_id\n"
+                     "Source (at least one): url  or  file_path\n"
+                     "All metadata is extracted automatically from each PDF."
+                 )).pack(anchor="w", pady=(0, 8))
+        self._btn(info_inner, "Download CSV Template",
+                  self._download_batch_template, "secondary",
+                  padx=14, pady=5).pack(anchor="w")
 
-        ctrl = tk.Frame(f, bg=PALETTE["bg"])
-        ctrl.pack(fill="x", **pad)
-        tk.Button(ctrl, text="Select Batch CSV", command=self._select_batch_csv,
-                  bg=PALETTE["navy_mid"], fg="white",
-                  font=("Helvetica", 10, "bold"), relief="flat",
-                  padx=12, pady=6).pack(side="left")
-        self._batch_file_label = tk.Label(ctrl, text="No file selected",
-                                          bg=PALETTE["bg"], fg=PALETTE["grey_mid"],
-                                          font=("Helvetica", 9, "italic"))
-        self._batch_file_label.pack(side="left", padx=10)
-        self._batch_run_btn = tk.Button(
-            ctrl, text="▶  Run Batch Analysis",
-            command=self._run_batch_analysis,
-            bg=PALETTE["amber"], fg=PALETTE["navy"],
-            font=("Helvetica", 10, "bold"), relief="flat",
-            padx=16, pady=6, cursor="hand2", state="disabled")
-        self._batch_run_btn.pack(side="right")
-        self._batch_stop_btn = tk.Button(
-            ctrl, text="⏹  Stop",
-            command=self._stop_batch,
-            bg=PALETTE["red"], fg="white",
-            font=("Helvetica", 10, "bold"), relief="flat",
-            padx=12, pady=6, cursor="hand2", state="disabled")
-        self._batch_stop_btn.pack(side="right", padx=6)
+        # ── File selection + controls ──
+        ctrl_inner = self._card(f, label="Batch File")
+        ctrl_row = tk.Frame(ctrl_inner, bg=PALETTE["surface"])
+        ctrl_row.pack(fill="x")
 
-        bp = tk.Frame(f, bg=PALETTE["navy_mid"])
-        bp.pack(fill="x", padx=16, pady=(4, 0))
+        self._btn(ctrl_row, "Select CSV", self._select_batch_csv,
+                  "secondary", padx=14, pady=6).pack(side="left")
+        self._batch_file_label = tk.Label(
+            ctrl_row, text="No file selected",
+            bg=PALETTE["surface"], fg=PALETTE["ink_faint"],
+            font=("Helvetica", 8, "italic"))
+        self._batch_file_label.pack(side="left", padx=12)
 
-        bp_bar_row = tk.Frame(bp, bg=PALETTE["navy_mid"])
-        bp_bar_row.pack(fill="x", padx=10, pady=(6, 2))
-        self._batch_pct_label = tk.Label(
-            bp_bar_row, text="0%", bg=PALETTE["navy_mid"],
-            fg=PALETTE["amber_light"], font=("Courier", 9, "bold"), width=5, anchor="e")
-        self._batch_pct_label.pack(side="right")
-        self._batch_progress = ttk.Progressbar(bp_bar_row, mode="determinate")
+        self._batch_stop_btn = self._btn(
+            ctrl_row, "⏹  Stop", self._stop_batch, "danger", padx=14, pady=6)
+        self._batch_stop_btn.pack(side="right")
+        self._batch_stop_btn.config(state="disabled")
+
+        self._batch_run_btn = self._btn(
+            ctrl_row, "Run Batch Analysis", self._run_batch_analysis,
+            "primary", padx=18, pady=6)
+        self._batch_run_btn.pack(side="right", padx=(0, 10))
+        self._batch_run_btn.config(state="disabled")
+
+        # ── Progress panel ──
+        prog_inner = self._card(f, label="Progress", pad=(20, 14))
+
+        # Bar row
+        bar_row = tk.Frame(prog_inner, bg=PALETTE["surface"])
+        bar_row.pack(fill="x", pady=(0, 6))
+        self._batch_progress = ttk.Progressbar(
+            bar_row, mode="determinate",
+            style="Thin.Horizontal.TProgressbar")
         self._batch_progress.pack(side="left", fill="x", expand=True)
+        self._batch_pct_label = tk.Label(
+            bar_row, text="", bg=PALETTE["surface"],
+            fg=PALETTE["ink_mid"], font=("Helvetica", 8, "bold"), width=5, anchor="e")
+        self._batch_pct_label.pack(side="right")
 
-        bp_status_row = tk.Frame(bp, bg=PALETTE["navy_mid"])
-        bp_status_row.pack(fill="x", padx=10, pady=1)
+        # Status row
+        stat_row = tk.Frame(prog_inner, bg=PALETTE["surface"])
+        stat_row.pack(fill="x")
         self._batch_status = tk.Label(
-            bp_status_row, text="", bg=PALETTE["navy_mid"],
-            fg=PALETTE["grey_light"], font=("Helvetica", 9, "italic"), anchor="w")
+            stat_row, text="", bg=PALETTE["surface"],
+            fg=PALETTE["ink_mid"], font=("Helvetica", 8), anchor="w")
         self._batch_status.pack(side="left", fill="x", expand=True)
         self._paper_timer_label = tk.Label(
-            bp_status_row, text="", bg=PALETTE["navy_mid"],
-            fg=PALETTE["teal_light"], font=("Courier", 9), anchor="e", width=14)
+            stat_row, text="", bg=PALETTE["surface"],
+            fg=PALETTE["brand_accent"], font=("Courier", 8), anchor="e", width=14)
         self._paper_timer_label.pack(side="right")
 
-        bp_stats_row = tk.Frame(bp, bg=PALETTE["navy_mid"])
-        bp_stats_row.pack(fill="x", padx=10, pady=(1, 6))
+        # Counts row
+        counts_row = tk.Frame(prog_inner, bg=PALETTE["surface"])
+        counts_row.pack(fill="x", pady=(4, 0))
         self._batch_counts_label = tk.Label(
-            bp_stats_row, text="", bg=PALETTE["navy_mid"],
-            fg=PALETTE["grey_mid"], font=("Helvetica", 8), anchor="w")
+            counts_row, text="", bg=PALETTE["surface"],
+            fg=PALETTE["ink_faint"], font=("Helvetica", 8), anchor="w")
         self._batch_counts_label.pack(side="left", fill="x", expand=True)
         self._batch_total_timer_label = tk.Label(
-            bp_stats_row, text="", bg=PALETTE["navy_mid"],
-            fg=PALETTE["amber_light"], font=("Courier", 9, "bold"), anchor="e", width=14)
+            counts_row, text="", bg=PALETTE["surface"],
+            fg=PALETTE["brand_accent"], font=("Courier", 8, "bold"), anchor="e", width=14)
         self._batch_total_timer_label.pack(side="right")
 
-        lf = tk.LabelFrame(f, text=" Batch Log ", bg=PALETTE["bg"],
-                           fg=PALETTE["navy"], font=("Helvetica", 10, "bold"),
-                           bd=1, relief="groove")
-        lf.pack(fill="both", expand=True, **pad)
+        # ── Log ──
+        log_outer = tk.Frame(f, bg=PALETTE["bg"])
+        log_outer.pack(fill="both", expand=True, padx=24, pady=(10, 16))
+
+        tk.Label(log_outer, text="LOG",
+                 bg=PALETTE["bg"], fg=PALETTE["ink_faint"],
+                 font=("Helvetica", 7, "bold"), anchor="w").pack(fill="x", pady=(0, 4))
+
+        log_card = tk.Frame(log_outer, bg=PALETTE["console_bg"],
+                            highlightbackground=PALETTE["border"],
+                            highlightthickness=1)
+        log_card.pack(fill="both", expand=True)
+
         self._batch_log = scrolledtext.ScrolledText(
-            lf, font=("Courier", 9), bg="#1e2636", fg="#c8d8f0",
-            bd=0, padx=10, pady=8, wrap="word")
-        self._batch_log.pack(fill="both", expand=True, padx=8, pady=8)
-        for tag, color in [("ok","#5BE8A0"), ("err","#FF7B7B"), ("info","#FFD166")]:
+            log_card, font=("Courier New", 9),
+            bg=PALETTE["console_bg"], fg=PALETTE["console_fg"],
+            bd=0, padx=16, pady=12, wrap="word")
+        self._batch_log.pack(fill="both", expand=True)
+
+        for tag, color in [
+            ("ok",   PALETTE["console_ok"]),
+            ("err",  PALETTE["console_err"]),
+            ("info", PALETTE["console_info"]),
+        ]:
             self._batch_log.tag_config(tag, foreground=color)
 
     # ── Repository Tab ────────────────────────────────────────────────────────
 
     def _build_repo_tab(self):
-        f   = self.tab_repo
-        pad = {"padx": 16, "pady": 8}
+        f = self.tab_repo
 
-        ctrl = tk.Frame(f, bg=PALETTE["bg"])
-        ctrl.pack(fill="x", **pad)
-        tk.Button(ctrl, text="Refresh", command=self._refresh_repository_tab,
-                  bg=PALETTE["teal"], fg="white",
-                  font=("Helvetica", 9, "bold"), relief="flat", padx=10).pack(side="left")
-        tk.Button(ctrl, text="Open Folder",
-                  command=lambda: os.startfile(REPO_DIR),
-                  bg=PALETTE["navy_mid"], fg="white",
-                  font=("Helvetica", 9, "bold"), relief="flat", padx=10
-                  ).pack(side="left", padx=8)
+        # ── Toolbar ──
+        bar = tk.Frame(f, bg=PALETTE["bg"])
+        bar.pack(fill="x", padx=24, pady=12)
 
-        ff = tk.Frame(ctrl, bg=PALETTE["bg"])
+        self._btn(bar, "Refresh", self._refresh_repository_tab,
+                  "secondary", padx=14, pady=5).pack(side="left")
+        self._btn(bar, "Open Folder",
+                  lambda: os.startfile(REPO_DIR),
+                  "ghost", padx=14, pady=5).pack(side="left", padx=8)
+
+        # Filter pills
+        ff = tk.Frame(bar, bg=PALETTE["bg"])
         ff.pack(side="right")
-        tk.Label(ff, text="Search:", bg=PALETTE["bg"], fg=PALETTE["grey_dark"],
-                 font=("Helvetica", 9)).pack(side="left")
+
+        tk.Label(ff, text="Search", bg=PALETTE["bg"], fg=PALETTE["ink_faint"],
+                 font=("Helvetica", 8)).pack(side="left", padx=(0, 4))
         self._filter_var = tk.StringVar()
         self._filter_var.trace_add("write", lambda *_: self._refresh_repository_tab())
-        tk.Entry(ff, textvariable=self._filter_var, width=20,
-                 font=("Helvetica", 9), bd=1, relief="solid").pack(side="left", padx=4)
+        srch = tk.Entry(ff, textvariable=self._filter_var,
+                        font=("Helvetica", 9), bd=0, relief="flat",
+                        bg=PALETTE["surface"], fg=PALETTE["ink"],
+                        insertbackground=PALETTE["ink"],
+                        highlightthickness=1,
+                        highlightbackground=PALETTE["border"],
+                        highlightcolor=PALETTE["ink"], width=18)
+        srch.pack(side="left", ipady=4, padx=(0, 16))
 
         self._rec_filter = tk.StringVar(value="All")
-        for val, color in [("All", PALETTE["grey_mid"]), ("INCLUDE", PALETTE["green"]),
-                           ("EXCLUDE", PALETTE["red"]), ("MANUAL_REVIEW", PALETTE["orange"])]:
-            tk.Radiobutton(ff, text=val, variable=self._rec_filter, value=val,
-                           command=self._refresh_repository_tab,
-                           bg=PALETTE["bg"], fg=color, activebackground=PALETTE["bg"],
-                           font=("Helvetica", 9, "bold"),
-                           selectcolor=PALETTE["amber"],
-                           indicatoron=1).pack(side="left", padx=4)
+        pill_cfg = [
+            ("All",          PALETTE["ink_mid"],  PALETTE["action_sec"]),
+            ("INCLUDE",      PALETTE["include"],   PALETTE["include_bg"]),
+            ("EXCLUDE",      PALETTE["exclude"],   PALETTE["exclude_bg"]),
+            ("MANUAL_REVIEW",PALETTE["manual"],    PALETTE["manual_bg"]),
+        ]
+        for val, fg, pill_bg in pill_cfg:
+            rb = tk.Radiobutton(
+                ff, text=val.replace("_", " "), variable=self._rec_filter,
+                value=val, command=self._refresh_repository_tab,
+                bg=PALETTE["bg"], fg=fg, activebackground=PALETTE["bg"],
+                activeforeground=fg, selectcolor=PALETTE["bg"],
+                font=("Helvetica", 8, "bold"),
+                indicatoron=0, relief="flat",
+                padx=10, pady=4,
+                cursor="hand2")
+            rb.pack(side="left", padx=2)
+
+        # ── Tree ──
+        tf = tk.Frame(f, bg=PALETTE["bg"])
+        tf.pack(fill="both", expand=True, padx=24, pady=(0, 4))
 
         cols   = ("paper_id", "title", "authors", "publication_year",
                   "journal_or_venue", "recommendation", "confidence", "analyzed_at")
-        widths = (80, 240, 160, 60, 140, 110, 70, 130)
-
-        tf = tk.Frame(f, bg=PALETTE["bg"])
-        tf.pack(fill="both", expand=True, padx=16, pady=(0, 4))
-
-        s = ttk.Style()
-        s.configure("Repo.Treeview", rowheight=26, font=("Helvetica", 9),
-                    background=PALETTE["white"], fieldbackground=PALETTE["white"],
-                    foreground=PALETTE["navy"])
-        s.configure("Repo.Treeview.Heading", font=("Helvetica", 9, "bold"),
-                    background=PALETTE["navy"], foreground="white")
+        widths = (72, 230, 150, 52, 138, 108, 66, 126)
 
         self._tree = ttk.Treeview(tf, columns=cols, show="headings",
                                   style="Repo.Treeview", selectmode="browse")
         for col, w in zip(cols, widths):
-            self._tree.heading(col, text=col.replace("_", " ").title(),
+            label = col.replace("_", " ").title()
+            self._tree.heading(col, text=label,
                                command=lambda c=col: self._sort_tree(c))
-            self._tree.column(col, width=w, anchor="w")
+            self._tree.column(col, width=w, anchor="w", minwidth=40)
 
         vsb = ttk.Scrollbar(tf, orient="vertical", command=self._tree.yview)
         self._tree.configure(yscrollcommand=vsb.set)
         self._tree.pack(side="left", fill="both", expand=True)
         vsb.pack(side="right", fill="y")
 
-        self._tree.tag_configure("include", background="#EAF9F1")
-        self._tree.tag_configure("exclude", background="#FDF0EF")
-        self._tree.tag_configure("manual",  background="#FEF9EC")
+        self._tree.tag_configure("include", background=PALETTE["include_bg"])
+        self._tree.tag_configure("exclude", background=PALETTE["exclude_bg"])
+        self._tree.tag_configure("manual",  background=PALETTE["manual_bg"])
         self._tree.bind("<Double-1>", self._view_repo_entry)
 
-        tk.Label(f, text="Double-click a row to view full analysis",
-                 bg=PALETTE["bg"], fg=PALETTE["grey_mid"],
-                 font=("Helvetica", 8, "italic")).pack(pady=2)
+        tk.Label(f, text="Double-click a row to view full analysis  ·  Click column headers to sort",
+                 bg=PALETTE["bg"], fg=PALETTE["ink_faint"],
+                 font=("Helvetica", 7, "italic")).pack(pady=4)
 
     # ── Settings Tab ──────────────────────────────────────────────────────────
 
     def _build_config_tab(self):
         f = self.tab_config
 
-        af = tk.LabelFrame(f, text=" Anthropic API Key ", bg=PALETTE["bg"],
-                           fg=PALETTE["navy"], font=("Helvetica", 10, "bold"),
-                           bd=1, relief="groove")
-        af.pack(fill="x", padx=20, pady=16)
-        inner = tk.Frame(af, bg=PALETTE["bg"])
-        inner.pack(fill="x", padx=16, pady=12)
+        # ── API Key card ──
+        key_inner = self._card(f, label="Anthropic API Key", pad=(20, 16))
 
-        kr = tk.Frame(inner, bg=PALETTE["bg"])
-        kr.pack(fill="x")
-        tk.Label(kr, text="API Key:", bg=PALETTE["bg"], fg=PALETTE["grey_dark"],
-                 font=("Helvetica", 9)).pack(side="left")
-        self._key_entry = tk.Entry(kr, textvariable=self._api_key,
-                                   font=("Courier", 10), show="*", width=55,
-                                   bd=1, relief="solid")
-        self._key_entry.pack(side="left", padx=8)
-        tk.Button(kr, text="Show/Hide", command=self._toggle_key_vis,
-                  bg=PALETTE["grey_light"], fg=PALETTE["navy"],
-                  font=("Helvetica", 8), relief="flat", padx=8).pack(side="left")
+        key_row = tk.Frame(key_inner, bg=PALETTE["surface"])
+        key_row.pack(fill="x")
 
-        tk.Label(inner, bg=PALETTE["bg"], fg=PALETTE["grey_mid"],
-                 font=("Helvetica", 8, "italic"), justify="left",
-                 text=(
-                     "\nAPI key is stored in memory only — never written to disk.\n"
-                     "Get a key:    https://console.anthropic.com  →  API Keys  →  Create Key\n"
-                     "Add credits:  https://console.anthropic.com  →  Billing   (minimum $5)\n\n"
-                     f"Model used:   {CLAUDE_MODEL}\n"
-                     "Cost:         ~$0.01–0.03 per paper  ·  200 papers ≈ $4–6 total"
-                 )).pack(anchor="w", pady=(4, 0))
+        self._key_entry = tk.Entry(
+            key_row, textvariable=self._api_key,
+            font=("Courier New", 10), show="*", width=50,
+            bd=0, relief="flat",
+            bg=PALETTE["surface_dim"], fg=PALETTE["ink"],
+            insertbackground=PALETTE["ink"],
+            highlightthickness=1,
+            highlightbackground=PALETTE["border"],
+            highlightcolor=PALETTE["ink"])
+        self._key_entry.pack(side="left", ipady=6, padx=(0, 10))
+        self._btn(key_row, "Show / Hide", self._toggle_key_vis,
+                  "ghost", padx=12, pady=5).pack(side="left")
 
-        tk.Frame(f, bg=PALETTE["grey_light"], height=1).pack(fill="x", padx=20, pady=8)
+        tk.Frame(key_inner, bg=PALETTE["border"], height=1).pack(fill="x", pady=12)
 
-        tk.Label(f, text="Repository Location", bg=PALETTE["bg"],
-                 fg=PALETTE["navy"], font=("Helvetica", 10, "bold")).pack(anchor="w", padx=20)
-        tk.Label(f, text=str(REPO_DIR), bg=PALETTE["bg"], fg=PALETTE["teal"],
-                 font=("Courier", 9)).pack(anchor="w", padx=20, pady=2)
-        tk.Label(f, bg=PALETTE["bg"], fg=PALETTE["grey_mid"],
-                 font=("Helvetica", 8, "italic"),
-                 text="paper_repository.json (full data)  ·  paper_repository.csv (spreadsheet)"
-                 ).pack(anchor="w", padx=20)
+        info_lines = [
+            ("Key is stored in memory only — never written to disk.", PALETTE["ink_faint"]),
+            ("Get a key:    console.anthropic.com  →  API Keys  →  Create Key", PALETTE["ink_mid"]),
+            ("Add credits:  console.anthropic.com  →  Billing  (minimum $5)", PALETTE["ink_mid"]),
+            ("", PALETTE["ink_faint"]),
+            (f"Model:   {CLAUDE_MODEL}", PALETTE["ink_mid"]),
+            ("Cost:    ~$0.01–0.03 per paper  ·  200 papers ≈ $4–6 total", PALETTE["ink_mid"]),
+        ]
+        for text, color in info_lines:
+            tk.Label(key_inner, text=text, bg=PALETTE["surface"],
+                     fg=color, font=("Helvetica", 8), anchor="w",
+                     justify="left").pack(fill="x")
+
+        # ── Repository card ──
+        repo_inner = self._card(f, label="Repository", pad=(20, 16))
+
+        tk.Label(repo_inner, text=str(REPO_DIR),
+                 bg=PALETTE["surface"], fg=PALETTE["ink"],
+                 font=("Courier New", 9), anchor="w").pack(fill="x")
+
+        tk.Frame(repo_inner, bg=PALETTE["border"], height=1).pack(fill="x", pady=10)
+
+        for label, fname in [
+            ("Full data (JSON):", "paper_repository.json"),
+            ("Spreadsheet (CSV):", "paper_repository.csv"),
+            ("Batch template:", "batch_template.csv"),
+        ]:
+            row = tk.Frame(repo_inner, bg=PALETTE["surface"])
+            row.pack(fill="x", pady=1)
+            tk.Label(row, text=label, bg=PALETTE["surface"],
+                     fg=PALETTE["ink_faint"], font=("Helvetica", 8),
+                     width=18, anchor="w").pack(side="left")
+            tk.Label(row, text=fname, bg=PALETTE["surface"],
+                     fg=PALETTE["ink_mid"], font=("Courier New", 8),
+                     anchor="w").pack(side="left")
 
     # ── Settings helpers ──────────────────────────────────────────────────────
 
@@ -722,12 +896,12 @@ class PaperScreenerApp(tk.Tk):
             if pdf_bytes:
                 self._current_pdf_bytes = pdf_bytes
                 self.after(0, lambda: self._file_label.config(
-                    text=f"Fetched ({len(pdf_bytes)//1024} KB)", fg=PALETTE["green"]))
+                    text=f"Fetched ({len(pdf_bytes)//1024} KB)", fg=PALETTE["include"]))
                 self.after(0, self._set_progress, "PDF fetched — ready to analyze.")
             else:
                 self._current_pdf_bytes = None
                 self.after(0, lambda: self._file_label.config(
-                    text=f"Failed: {err[:55]}", fg=PALETTE["red"]))
+                    text=f"Failed: {err[:55]}", fg=PALETTE["exclude"]))
                 self.after(0, self._set_progress, "Fetch failed — upload PDF manually.")
                 self.after(0, messagebox.showwarning, "Fetch Failed",
                            f"Could not retrieve PDF:\n{err}\n\nPlease upload the PDF manually.")
@@ -743,7 +917,7 @@ class PaperScreenerApp(tk.Tk):
             name = Path(path).name
             self._file_label.config(
                 text=f"{name} ({len(self._current_pdf_bytes)//1024} KB)",
-                fg=PALETTE["green"])
+                fg=PALETTE["include"])
             self._set_progress(f"Loaded: {name}")
 
     def _run_single_analysis(self):
@@ -891,7 +1065,7 @@ class PaperScreenerApp(tk.Tk):
             title="Select Batch CSV", filetypes=[("CSV files", "*.csv")])
         if path:
             self._batch_csv_path = path
-            self._batch_file_label.config(text=Path(path).name, fg=PALETTE["navy"])
+            self._batch_file_label.config(text=Path(path).name, fg=PALETTE["ink"])
             self._batch_run_btn.config(state="normal")
 
     def _run_batch_analysis(self):
@@ -1093,14 +1267,26 @@ class PaperScreenerApp(tk.Tk):
         if not entry: return
         win = tk.Toplevel(self)
         win.title(f"Paper Detail — {sel[0]}")
-        win.geometry("820x640")
+        win.geometry("860x680")
         win.configure(bg=PALETTE["bg"])
-        tk.Label(win, text=f"{sel[0]}  |  {entry.get('title','(no title)')}",
-                 bg=PALETTE["navy"], fg=PALETTE["amber"],
-                 font=("Georgia", 11, "bold"), padx=12, pady=8).pack(fill="x")
-        txt = scrolledtext.ScrolledText(win, font=("Courier", 9), bg="#1e2636",
-                                        fg="#c8d8f0", bd=0, padx=12, pady=10, wrap="word")
-        txt.pack(fill="both", expand=True, padx=12, pady=12)
+
+        # Header bar
+        hdr = tk.Frame(win, bg=PALETTE["brand"], height=48)
+        hdr.pack(fill="x")
+        hdr.pack_propagate(False)
+        tk.Label(hdr, text=f"{sel[0]}  ·  {entry.get('title','(no title)')}",
+                 bg=PALETTE["brand"], fg=PALETTE["brand_accent"],
+                 font=("Helvetica", 10, "bold"), anchor="w",
+                 padx=20).pack(fill="both", expand=True)
+
+        # JSON panel
+        txt_frame = tk.Frame(win, bg=PALETTE["console_bg"])
+        txt_frame.pack(fill="both", expand=True, padx=16, pady=12)
+        txt = scrolledtext.ScrolledText(
+            txt_frame, font=("Courier New", 9),
+            bg=PALETTE["console_bg"], fg=PALETTE["console_fg"],
+            bd=0, padx=16, pady=12, wrap="word")
+        txt.pack(fill="both", expand=True)
         full    = entry.get("_full_result", {})
         display = full if full else {k: v for k, v in entry.items() if k != "_full_result"}
         txt.insert("end", json.dumps(display, indent=2))
