@@ -40,7 +40,7 @@ python app.py
 1. Go to the **Single Paper** tab
 2. Enter a **Paper ID** (required — used as the unique identifier in the repository)
 3. Either:
-   - Paste a **URL** and click **Fetch PDF** (works for direct PDF links; paywalled pages will fail and require manual upload)
+   - Paste a **URL** and click **Fetch** (works for direct PDF links; paywalled pages will fail and require manual upload)
    - Or click **Upload PDF** to load a local file
 4. Click **▶ Analyze Paper**
 5. Results appear in the panel below and are saved automatically to the repository
@@ -66,7 +66,7 @@ from the PDF — no manual entry required beyond the Paper ID.
 - All metadata (title, authors, year, journal, DOI, abstract) is extracted from the PDF automatically — no need to include it in the CSV
 - Columns can be in any order; extra columns are ignored
 
-4. Click **Select Batch CSV** then **▶ Run Batch Analysis**
+4. Click **Select CSV** then **Run Batch Analysis**
 5. Progress, per-paper timing, and running counts appear in the progress panel
 6. Click **⏹ Stop** at any time to halt after the current paper finishes — completed results are saved
 
